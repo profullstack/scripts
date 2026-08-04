@@ -68,6 +68,30 @@ Options:
 
 The closing summary counts `ready`, `readied`, `merged`, `skipped`, and `failed`.
 
+## `wrappers/`
+
+Snapshots of the launcher scripts that third-party installers drop into
+`~/.local/bin`. They are kept here for reference and recovery, not for
+installation:
+
+| File | Installed by | Launches |
+| --- | --- | --- |
+| `coinpay` | `https://coinpayportal.com/install.sh` | `~/.coinpay/pkg/bin/coinpay.js` |
+| `moshcode` | `https://moshcoding.com/install.sh` | `~/.moshcode/pkg/bin/moshcode.mjs` |
+| `moshscript` | `https://moshcoding.com/install.sh` | `moshcode.mjs run` |
+| `logicsrc` | logicsrc CLI | `~/.logicsrc-cli/.../cli/dist/index.js` |
+
+Two reasons they live outside `bin/` and are deliberately **not** symlinked:
+
+- They hardcode absolute `/home/anthony` paths, so they are not portable to
+  another machine or user.
+- Their installers rewrite `~/.local/bin/<name>` on every update. Symlinking
+  would let an installer write through into this repository, producing surprise
+  diffs or silently replacing the link.
+
+Re-run the relevant installer to restore or update one; copy from here only if
+an installer is unavailable and you need the old contents back.
+
 ## Requirements
 
 `gh` (authenticated), `jq`, and `awk`.

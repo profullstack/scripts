@@ -1,0 +1,3 @@
+#!/bin/sh
+# moshscript wrapper — installed by https://moshcoding.com/install.sh. Re-run the installer to update.
+exec node "/home/anthony/.moshcode/pkg/bin/moshcode.mjs" run "$@"

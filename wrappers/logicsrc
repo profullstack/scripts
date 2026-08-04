@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node "/home/anthony/.logicsrc-cli/src/packages/cli/dist/index.js" "$@"
