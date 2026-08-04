@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+orgs=''
+users=''
+limit=1000
+apply=0
+allow_no_checks=0
+ready_drafts=1
+
+usage() {
+  cat <<'EOF'
+Usage:
+  gh-prs-merge --orgs ORG1,ORG2 [--users USER1,USER2] [--limit N] [--apply]
+  gh-prs-merge --users USER1,USER2 [--limit N] [--apply]
+
+By default, this performs a dry run.
+
+Options:
+  --orgs ORG1,ORG2       Search repositories owned by these organizations
+  --users USER1,USER2    Search repositories owned by these personal accounts
+  --limit N              Maximum PRs per owner; default 1000
+  --apply                Actually squash-merge eligible PRs
+  --allow-no-checks      Also merge clean PRs that have no CI checks
+  --no-ready-drafts      Ignore draft PRs instead of marking them ready
+  -h, --help             Show this help
+
+Drafts:
+  Draft PRs are included by default. With --apply they are marked ready for
+  review, then re-evaluated against the eligibility rules below and merged if
+  they qualify. In a dry run they are reported as WOULD-READY and not changed.
+  Use --no-ready-drafts to leave drafts alone entirely.
+
+Eligibility:
+  - PR is open
+  - PR is not a draft, or was successfully marked ready
+  - mergeable is MERGEABLE
+  - mergeStateStatus is CLEAN
+  - at least one CI check exists, unless --allow-no-checks is used
+  - every check is pass or skipping
+  - head commit has not changed when the merge is submitted
+EOF
+}
+
+die() {
+  printf 'gh-prs-merge: %s\n' "$*" >&2
+  exit 2
+}
+
+while (($#)); do
+  case "$1" in
+    --orgs)
+      (($# >= 2)) || die '--orgs requires a comma-separated value'
+      orgs=$2
+      shift 2
+      ;;
+
+    --orgs=*)
+      orgs=${1#*=}
+      shift
+      ;;
+
+    --users)
+      (($# >= 2)) || die '--users requires a comma-separated value'
+      users=$2
+      shift 2
+      ;;
+
+    --users=*)
+      users=${1#*=}
+      shift
+      ;;
+
+    --limit)
+      (($# >= 2)) || die '--limit requires a number'
+      limit=$2
+      shift 2
+      ;;
+
+    --limit=*)
+      limit=${1#*=}
+      shift
+      ;;
+
+    --apply)
+      apply=1
+      shift
+      ;;
+
+    --allow-no-checks)
+      allow_no_checks=1
+      shift
+      ;;
+
+    --ready-drafts)
+      ready_drafts=1
+      shift
+      ;;
+
+    --no-ready-drafts)
+      ready_drafts=0
+      shift
+      ;;
+
+    -h|--help)
+      usage
+      exit 0
+      ;;
+
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+for dependency in gh jq; do
+  command -v "$dependency" >/dev/null 2>&1 ||
+    die "required command not found: $dependency"
+done
+
+[[ $limit =~ ^[1-9][0-9]*$ ]] ||
+  die '--limit must be a positive integer'
+
+((limit <= 1000)) ||
+  die '--limit cannot exceed 1000'
+
+org_list=()
+user_list=()
+
+split_csv() {
+  local csv=$1
+  local -n destination=$2
+  local item
+  local -a raw=()
+
+  [[ -n $csv ]] || return 0
+
+  IFS=',' read -r -a raw <<< "$csv"
+
+  for item in "${raw[@]}"; do
+    # Trim surrounding whitespace.
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+
+    [[ -n $item ]] && destination+=("$item")
+  done
+}
+
+split_csv "$orgs" org_list
+split_csv "$users" user_list
+
+if ((${#org_list[@]} == 0 && ${#user_list[@]} == 0)); then
+  usage >&2
+  die 'pass --orgs, --users, or both'
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+search_scope() {
+  local qualifier=$1
+  local owner=$2
+  local -a draft_filter=()
+
+  # Drafts are pulled in so they can be marked ready; --no-ready-drafts
+  # restores the old behaviour of never seeing them at all.
+  ((ready_drafts)) || draft_filter=(--draft=false)
+
+  if ! GH_PAGER=cat gh search prs "${qualifier}:${owner}" \
+    --state=open \
+    --archived=false \
+    "${draft_filter[@]}" \
+    --sort=created \
+    --order=asc \
+    --limit="$limit" \
+    --json url,createdAt >> "$tmp"
+  then
+    printf 'WARN: skipped inaccessible or invalid scope %s:%s\n' \
+      "$qualifier" "$owner" >&2
+  fi
+}
+
+# Organizations use org:
+for org in "${org_list[@]}"; do
+  search_scope org "$org"
+done
+
+# Personal repository owners use user:
+for user in "${user_list[@]}"; do
+  search_scope user "$user"
+done
+
+# Combine, deduplicate, and process oldest PRs first.
+mapfile -t prs < <(
+  jq -sr '
+    (add // [])
+    | unique_by(.url)
+    | sort_by(.createdAt)
+    | .[].url
+  ' "$tmp"
+)
+
+if ((${#prs[@]} == 0)); then
+  if ((ready_drafts)); then
+    echo 'No open PRs found.'
+  else
+    echo 'No open, non-draft PRs found.'
+  fi
+  exit 0
+fi
+
+if ((apply)); then
+  if ((ready_drafts)); then
+    echo 'MODE: APPLY — drafts will be marked ready and eligible PRs squash-merged.'
+  else
+    echo 'MODE: APPLY — eligible PRs will be squash-merged.'
+  fi
+else
+  echo 'MODE: DRY RUN — nothing will be merged. Add --apply to merge.'
+fi
+
+merged=0
+ready=0
+readied=0
+skipped=0
+failed=0
+
+# Populates $metadata for a PR, retrying while GitHub is still computing
+# state. Pass a second argument to also wait for a just-readied PR to stop
+# reporting itself as a draft.
+fetch_metadata() {
+  local pr=$1
+  local await_ready=${2:-0}
+  local attempt
+
+  metadata=''
+
+  for attempt in 1 2 3 4 5; do
+    if metadata=$(
+      GH_PAGER=cat gh pr view "$pr" \
+        --json state,isDraft,mergeable,mergeStateStatus,headRefOid,title,url \
+        2>/dev/null
+    ); then
+      # GitHub may briefly report UNKNOWN while calculating mergeability.
+      if [[ $(jq -r '.mergeable' <<< "$metadata") != UNKNOWN ]]; then
+        if ((await_ready == 0)) ||
+           [[ $(jq -r '.isDraft' <<< "$metadata") != true ]]
+        then
+          break
+        fi
+      fi
+    fi
+
+    sleep 2
+  done
+}
+
+# Splits $metadata into the fields the eligibility rules read.
+parse_metadata() {
+  state=$(jq -r '.state' <<< "$metadata")
+  draft=$(jq -r '.isDraft' <<< "$metadata")
+  mergeable=$(jq -r '.mergeable' <<< "$metadata")
+  merge_state=$(jq -r '.mergeStateStatus' <<< "$metadata")
+  head_sha=$(jq -r '.headRefOid' <<< "$metadata")
+  title=$(
+    jq -r '.title | gsub("[\r\n\t]+"; " ")' <<< "$metadata"
+  )
+}
+
+for pr in "${prs[@]}"; do
+  fetch_metadata "$pr"
+
+  if [[ -z $metadata ]] ||
+     ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$metadata"
+  then
+    printf 'SKIP  %s — could not read PR metadata\n' "$pr"
+    ((skipped += 1))
+    continue
+  fi
+
+  parse_metadata
+
+  # Take drafts out of draft first, then judge them like any other PR.
+  if [[ $draft == true && $state == OPEN ]] && ((ready_drafts)); then
+    if ((apply == 0)); then
+      printf 'WOULD-READY %s — draft; would mark ready, then re-check — %s\n' \
+        "$pr" "$title"
+      ((skipped += 1))
+      continue
+    fi
+
+    if GH_PAGER=cat gh pr ready "$pr"; then
+      printf 'READIED %s — %s\n' "$pr" "$title"
+      ((readied += 1))
+
+      fetch_metadata "$pr" 1
+
+      if [[ -z $metadata ]] ||
+         ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$metadata"
+      then
+        printf 'SKIP  %s — could not re-read PR metadata after marking ready\n' \
+          "$pr"
+        ((skipped += 1))
+        continue
+      fi
+
+      parse_metadata
+    else
+      printf 'FAILED %s — could not mark draft ready\n' "$pr" >&2
+      ((failed += 1))
+      continue
+    fi
+  fi
+
+  checks='[]'
+  checks_output=''
+
+  # gh pr checks may exit nonzero for pending/failed checks while still
+  # returning JSON, so evaluate the JSON buckets directly.
+  checks_output=$(
+    GH_PAGER=cat gh pr checks "$pr" \
+      --json bucket,name 2>/dev/null
+  ) || true
+
+  if [[ -n $checks_output ]] &&
+     jq -e 'type == "array"' >/dev/null 2>&1 <<< "$checks_output"
+  then
+    checks=$checks_output
+  fi
+
+  check_count=$(jq 'length' <<< "$checks")
+
+  bad_checks=$(
+    jq '
+      [
+        .[]
+        | select(
+            .bucket != "pass" and
+            .bucket != "skipping"
+          )
+      ]
+      | length
+    ' <<< "$checks"
+  )
+
+  bad_check_names=$(
+    jq -r '
+      [
+        .[]
+        | select(
+            .bucket != "pass" and
+            .bucket != "skipping"
+          )
+        | "\(.name)=\(.bucket)"
+      ]
+      | join(", ")
+    ' <<< "$checks"
+  )
+
+  reason=''
+
+  if [[ $state != OPEN ]]; then
+    reason="state=$state"
+  elif [[ $draft == true ]]; then
+    reason='draft'
+  elif [[ $mergeable != MERGEABLE ]]; then
+    reason="mergeable=$mergeable"
+  elif [[ $merge_state != CLEAN ]]; then
+    reason="mergeStateStatus=$merge_state"
+  elif ((check_count == 0 && allow_no_checks == 0)); then
+    reason='no CI checks found'
+  elif ((bad_checks > 0)); then
+    reason="checks not green: $bad_check_names"
+  fi
+
+  if [[ -n $reason ]]; then
+    printf 'SKIP  %s — %s — %s\n' "$pr" "$reason" "$title"
+    ((skipped += 1))
+    continue
+  fi
+
+  printf 'READY %s — %s checks green — %s\n' \
+    "$pr" "$check_count" "$title"
+
+  ((ready += 1))
+
+  if ((apply)); then
+    # Deliberately no --admin: GitHub rules and protections remain enforced.
+    if GH_PAGER=cat gh pr merge "$pr" \
+      --squash \
+      --match-head-commit "$head_sha"
+    then
+      printf 'MERGED %s\n' "$pr"
+      ((merged += 1))
+    else
+      printf 'FAILED %s — GitHub refused the merge\n' "$pr" >&2
+      ((failed += 1))
+    fi
+  fi
+done
+
+printf '\nSummary: ready=%d readied=%d merged=%d skipped=%d failed=%d\n' \
+  "$ready" "$readied" "$merged" "$skipped" "$failed"

@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+orgs=''
+users=''
+limit=1000
+
+usage() {
+  cat <<'EOF'
+Usage:
+  gh-prs --orgs ORG1,ORG2 [--users USER1,USER2] [--limit NUMBER]
+  gh-prs --users USER1,USER2 [--limit NUMBER]
+
+Examples:
+  gh-prs --orgs profullstack,moshcoder,h4kr,infernetprotocol
+  gh-prs --users ralyodio,devpreshy
+  gh-prs --orgs profullstack,moshcoder --users ralyodio,devpreshy
+EOF
+}
+
+die() {
+  printf 'gh-prs: %s\n' "$*" >&2
+  exit 2
+}
+
+while (($#)); do
+  case "$1" in
+    --orgs)
+      (($# >= 2)) || die '--orgs requires a comma-separated value'
+      orgs=$2
+      shift 2
+      ;;
+
+    --orgs=*)
+      orgs=${1#*=}
+      shift
+      ;;
+
+    --users)
+      (($# >= 2)) || die '--users requires a comma-separated value'
+      users=$2
+      shift 2
+      ;;
+
+    --users=*)
+      users=${1#*=}
+      shift
+      ;;
+
+    --limit)
+      (($# >= 2)) || die '--limit requires a number'
+      limit=$2
+      shift 2
+      ;;
+
+    --limit=*)
+      limit=${1#*=}
+      shift
+      ;;
+
+    -h|--help)
+      usage
+      exit 0
+      ;;
+
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+for dependency in gh jq awk; do
+  command -v "$dependency" >/dev/null 2>&1 ||
+    die "required command not found: $dependency"
+done
+
+[[ $limit =~ ^[1-9][0-9]*$ ]] ||
+  die '--limit must be a positive integer'
+
+((limit <= 1000)) ||
+  die '--limit cannot exceed 1000'
+
+org_list=()
+user_list=()
+
+split_csv() {
+  local csv=$1
+  local -n destination=$2
+  local item
+  local -a raw=()
+
+  [[ -n $csv ]] || return 0
+
+  IFS=',' read -r -a raw <<< "$csv"
+
+  for item in "${raw[@]}"; do
+    # Trim whitespace around each value.
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+
+    [[ -n $item ]] && destination+=("$item")
+  done
+}
+
+split_csv "$orgs" org_list
+split_csv "$users" user_list
+
+if ((${#org_list[@]} == 0 && ${#user_list[@]} == 0)); then
+  usage >&2
+  die 'pass --orgs, --users, or both'
+fi
+
+search_scope() {
+  local qualifier=$1
+  local owner=$2
+
+  GH_PAGER=cat gh search prs "${qualifier}:${owner}" \
+    --state=open \
+    --archived=false \
+    --sort=created \
+    --order=desc \
+    --limit="$limit" \
+    --json repository,number,title,url,author,createdAt,updatedAt
+}
+
+# Enable real terminal hyperlinks when stdout is a terminal.
+hyperlinks=0
+
+if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
+  hyperlinks=1
+fi
+
+{
+  # Organizations use org:
+  for org in "${org_list[@]}"; do
+    search_scope org "$org"
+  done
+
+  # Personal repository owners use user:
+  for user in "${user_list[@]}"; do
+    search_scope user "$user"
+  done
+} |
+jq -rs '
+  def clean:
+    tostring | gsub("[\t\r\n]+"; " ");
+
+  def truncate($length):
+    if length > $length
+    then .[0:($length - 3)] + "..."
+    else .
+    end;
+
+  def plural($number; $unit):
+    "\($number) \($unit)\(if $number == 1 then "" else "s" end) ago";
+
+  def timeago:
+    ([0, (now - fromdateiso8601)] | max) as $seconds
+    | if $seconds < 60 then
+        plural(($seconds | floor); "second")
+      elif $seconds < 3600 then
+        plural((($seconds / 60) | floor); "minute")
+      elif $seconds < 86400 then
+        plural((($seconds / 3600) | floor); "hour")
+      elif $seconds < 604800 then
+        plural((($seconds / 86400) | floor); "day")
+      elif $seconds < 2629800 then
+        plural((($seconds / 604800) | floor); "week")
+      elif $seconds < 31557600 then
+        plural((($seconds / 2629800) | floor); "month")
+      else
+        plural((($seconds / 31557600) | floor); "year")
+      end;
+
+  (add // [])
+  | unique_by(.url)
+  | sort_by(.createdAt)
+  | reverse
+  | (
+      [
+        "ORG/USER",
+        "REPOSITORY",
+        "PR",
+        "AUTHOR",
+        "TITLE",
+        "UPDATED",
+        "LINK"
+      ],
+
+      (.[] | [
+        (.repository.nameWithOwner | split("/")[0]),
+        .repository.nameWithOwner,
+        ("#" + (.number | tostring)),
+        (.author.login // "-"),
+        (.title | clean | truncate(70)),
+        (.updatedAt | timeago),
+        .url
+      ])
+    )
+  | @tsv
+' |
+awk -F '\t' -v hyperlinks="$hyperlinks" '
+  {
+    rows = NR
+    field_count[NR] = NF
+
+    for (column = 1; column <= NF; column++) {
+      cell[NR, column] = $column
+
+      if (length($column) > width[column]) {
+        width[column] = length($column)
+      }
+    }
+  }
+
+  END {
+    escape = sprintf("%c", 27)
+
+    for (row = 1; row <= rows; row++) {
+      url = cell[row, field_count[row]]
+
+      for (column = 1; column <= field_count[row]; column++) {
+        # Make both #123 and the full URL clickable.
+        linked = hyperlinks && row > 1 && \
+          (column == 3 || column == field_count[row])
+
+        if (linked) {
+          link_start = escape "]8;;" url escape "\\"
+          link_end = escape "]8;;" escape "\\"
+        } else {
+          link_start = ""
+          link_end = ""
+        }
+
+        if (column < field_count[row]) {
+          printf "%s%-*s%s  ", \
+            link_start, width[column], cell[row, column], link_end
+        } else {
+          printf "%s%s%s\n", link_start, cell[row, column], link_end
+        }
+      }
+    }
+  }
+'
