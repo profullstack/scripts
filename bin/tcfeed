@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# tcfeed — read the newest posts on a subreddit, find the repositories they
+# link, scan each one, and print a shortlist worth reading.
+#
+#   tcfeed                              # the 50 newest posts
+#   tcfeed 100                          # more of them
+#   tcfeed --forget                     # look at everything again next time
+#   tcfeed pr owner/name [--dry-run]    # install the scan workflow
+#   tcfeed check [--fix]                # how are the open requests doing
+#
+# An executable rather than the shell function this used to be, for the same
+# reason gh-prs-fix-all is one: the moshcode pit runs its aliases with
+# `zsh -c <command>`, and `zsh -c` is a non-interactive shell that reads
+# neither ~/.zshrc nor ~/.zsh_aliases. A function defined there is simply not
+# there, so `/alias tcfeed "tcfeed"` in the pit answered `command not found`
+# while the identical word worked when typed at a prompt.
+#
+# Nothing should alias to this either. A function beats PATH, so a wrapper of
+# the same name silently shadows this file and the two drift apart — which is
+# exactly how the function version survived long enough to be confusing.
+#
+# Everything configurable lives in the header of the TypeScript this launches
+# and is read from the environment by it, so exporting TCFEED_MIN_GAP,
+# TCFEED_MAX, TCFEED_PAUSE, TCFEED_SUB, TCFEED_CACHE, TC_BIN and the rest works
+# exactly as it did before.
+#
+#   TCFEED_REPO   where threatcrush is checked out, default below
+set -euo pipefail
+
+repo=${TCFEED_REPO:-$HOME/src/profullstack/threatcrush}
+script="$repo/bin/tcfeed.ts"
+
+if [ ! -f "$script" ]; then
+	printf 'tcfeed: no script at %s\n' "$script" >&2
+	printf '  git -C %s pull           # it lives in the threatcrush repo\n' "$repo" >&2
+	printf '  TCFEED_REPO=/elsewhere   # if the checkout moved\n' >&2
+	exit 1
+fi
+
+# Run from the repo so npx resolves tsx against its node_modules before reaching
+# for the network. The script itself does not care where it is.
+cd "$repo"
+exec npx --yes tsx bin/tcfeed.ts "$@"
