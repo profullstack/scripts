@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# gh-prs-fix-all — look at every open threatcrush-scan pull request, and fix the
+# ones that are broken because of us.
+#
+# A real file on PATH rather than a shell function, and that is the whole point
+# of it. The pit runs its aliases with `zsh -c <command>`, and `zsh -c` is a
+# non-interactive shell: it does not read ~/.zshrc and it does not read
+# ~/.zsh_aliases, so a function defined there is simply not there. The first
+# version of this was a function and `/gh-prs-fix-all` in the pit answered
+# `command not found` while the identical word worked when typed at a prompt.
+# An executable works from all three — an interactive shell, `zsh -c`, and the
+# pit — because none of them have to have sourced anything first.
+#
+#   gh-prs-fix-all                 # fix ours, report theirs, leave theirs alone
+#   gh-prs-fix-all --dry-run       # change nothing, just say what stands
+#   gh-prs-fix-all owner/name ...  # only these
+#
+# The name says fix-all and it will not fix all, which is deliberate. Pushing
+# the branch to a fork sets off whatever the upstream repo runs on push, so
+# their test suite goes red against a commit that only added files under
+# .github/. Those failures are reported and never touched. Failures in our own
+# workflow that it does not recognise are printed rather than guessed at: a
+# speculative commit pushed onto a stranger's review is worse than red, because
+# red is at least honest.
+set -euo pipefail
+
+repo=${TCFEED_REPO:-$HOME/src/profullstack/threatcrush}
+script="$repo/bin/tcfeed.ts"
+
+if [ ! -f "$script" ]; then
+	printf 'gh-prs-fix-all: no script at %s\n' "$script" >&2
+	printf '  git -C %s pull        # tcfeed check landed in #111\n' "$repo" >&2
+	printf '  TCFEED_REPO=/elsewhere   # if the checkout moved\n' >&2
+	exit 1
+fi
+
+# Refuse a checkout that predates the subcommand, rather than handing it a word
+# it does not know. tcfeed reads its first argument as a post count and falls
+# back to 50 when it is not a number, so an older script answers `check` by
+# fetching reddit and scanning ten strangers' repositories — a long, rate-
+# limited, entirely wrong thing to do in response to "fix my pull requests".
+if ! grep -q "argument === 'check'" "$script"; then
+	printf 'gh-prs-fix-all: %s has no `check` subcommand.\n' "$script" >&2
+	printf '  git -C %s pull      # it is on master, this checkout is behind\n' "$repo" >&2
+	printf '  Without this guard the old script would read `check` as a post\n' >&2
+	printf '  count, fall back to 50, and go scan reddit instead.\n' >&2
+	exit 1
+fi
+
+# `check` without --fix reports and changes nothing; with it, it acts. Anything
+# else on the command line is passed straight through, so naming repositories
+# works the same as it does for tcfeed itself.
+args=(check)
+for arg in "$@"; do
+	case "$arg" in
+		--dry-run | -n) ;; # reporting is already the default without --fix
+		*) args+=("$arg") ;;
+	esac
+done
+
+case " $* " in
+	*" --dry-run "* | *" -n "*) ;;
+	*) args+=(--fix) ;;
+esac
+
+# Run from the repo so npx resolves tsx against its node_modules before reaching
+# for the network. The script itself does not care where it is.
+cd "$repo"
+exec npx --yes tsx bin/tcfeed.ts "${args[@]}"
