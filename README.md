@@ -68,6 +68,36 @@ Options:
 
 The closing summary counts `ready`, `readied`, `merged`, `skipped`, and `failed`.
 
+### `domainjson`
+
+Whois-style, JSON-first name lookup. Prints a single JSON object:
+
+```json
+{ "name": "...", "rdap": { ... }, "dns": { "records": {}, "hosts": [], "reverse": [], "axfr": [] } }
+```
+
+```sh
+domainjson example.com
+domainjson --timeout 8000 test.hacker
+domainjson -s https://rdap.nic.cz -t domain example.cz   # openrdap args pass through
+```
+
+Names ending in a [Moshpit](https://pit.moshcode.sh) TLD skip RDAP and are
+served from the registry API under a `moshpit` key instead. Everything else
+goes through the OpenRDAP CLI (`rdap`); its flags pass through unchanged,
+except the output-format flags (`--text`, `--whois`, `--raw`), which are
+dropped — the RDAP section is always JSON. DNS is queried one type at a time
+(`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`; never `ANY`), plus reverse PTR for
+every resolved address and an AXFR attempt against each nameserver — a
+refused transfer is reported, never fatal. If every data source fails, the
+exit status is non-zero and the JSON carries an `error` key.
+
+| Flag | Effect |
+| --- | --- |
+| `--registry URL` | Moshpit registry base URL, default `https://pit.moshcode.sh` |
+| `--timeout MS` | per-query timeout for HTTP and dig, default 4000 |
+| `--name NAME` | alternative to the positional name argument |
+
 ## `wrappers/`
 
 Snapshots of the launcher scripts that third-party installers drop into
@@ -94,4 +124,6 @@ an installer is unavailable and you need the old contents back.
 
 ## Requirements
 
-`gh` (authenticated), `jq`, and `awk`.
+`gh` (authenticated), `jq`, and `awk`. `domainjson` additionally wants `node`,
+`dig`, and the OpenRDAP CLI (`go install github.com/openrdap/rdap/cmd/rdap@latest`,
+run from `~/go/bin/rdap` or on `PATH`).

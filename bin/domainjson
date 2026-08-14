@@ -1,0 +1,349 @@
+#!/usr/bin/env node
+// domainjson — whois-style, JSON-first name lookup.
+//
+// One JSON object on stdout:
+//
+//   { "name": ..., "rdap": {...} | "moshpit": {...}, "dns": {...} }
+//
+// Names ending in a Moshpit TLD (https://pit.moshcode.sh) are served from the
+// registry API; everything else goes through the OpenRDAP CLI (`rdap`), whose
+// flags are passed through unchanged except the output-format flags — the RDAP
+// portion is always JSON. Either way, dig adds records, hosts, reverse, and
+// per-nameserver AXFR attempts.
+
+import { execFile } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access } from 'node:fs/promises';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
+
+const run = promisify(execFile);
+
+const DEFAULT_REGISTRY = 'https://pit.moshcode.sh';
+const DEFAULT_TIMEOUT_MS = 4000;
+const DIG = '/usr/bin/dig';
+const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
+
+// OpenRDAP flags that produce non-JSON output; dropped from passthrough
+// because the RDAP section is always forced to --json.
+const OUTPUT_FORMAT_FLAGS = new Set(['--text', '-w', '--whois', '-r', '--raw', '-j', '--json']);
+
+// OpenRDAP flags that consume the following argument, so that argument must
+// not be mistaken for the name.
+const VALUE_FLAGS = new Set([
+  '-T', '--timeout',
+  '-s', '--server',
+  '-t', '--type',
+  '--cache-dir', '--bs-url', '--bs-ttl',
+  '-P', '--p12',
+  '-C', '--cert',
+  '-K', '--key',
+]);
+
+const usage = `Usage:
+  domainjson [openrdap-args...] <name>
+  domainjson --name example.com
+  domainjson --registry https://pit.moshcode.sh --timeout 4000 example.hacker
+
+The final non-flag argument is the name to look up. OpenRDAP flags
+(-s/--server, -t/--type, -T/--timeout, -k, --bs-url, --cache-dir, -P/-C/-K,
+...) are passed through unchanged; output-format flags (--text, --whois,
+--raw, --json) are dropped and JSON is always forced.
+
+Options:
+  --registry URL   Moshpit registry base URL (default: ${DEFAULT_REGISTRY})
+  --timeout MS     per-query timeout for HTTP and dig (default: ${DEFAULT_TIMEOUT_MS})
+  --name NAME      the name to look up (alternative to the positional)
+  -h, --help       show this help
+`;
+
+function fail(message, code = 2) {
+  process.stdout.write(`${JSON.stringify({ error: message })}\n`);
+  process.exit(code);
+}
+
+// --- argument parsing -------------------------------------------------------
+
+function parseArgs(argv) {
+  const own = { registry: DEFAULT_REGISTRY, timeout: DEFAULT_TIMEOUT_MS, name: null };
+  const passthrough = [];
+  const positionals = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg === '-h' || arg === '--help') {
+      process.stdout.write(usage);
+      process.exit(0);
+    }
+
+    if (arg === '--registry' || arg === '--timeout' || arg === '--name') {
+      const value = argv[++i];
+      if (value === undefined) fail(`${arg} requires a value`);
+      if (arg === '--registry') own.registry = value.replace(/\/+$/, '');
+      else if (arg === '--name') own.name = value;
+      else {
+        own.timeout = Number.parseInt(value, 10);
+        if (!Number.isFinite(own.timeout) || own.timeout <= 0) fail('--timeout must be a positive integer (ms)');
+      }
+      continue;
+    }
+
+    if (arg.startsWith('--registry=')) { own.registry = arg.slice('--registry='.length).replace(/\/+$/, ''); continue; }
+    if (arg.startsWith('--timeout=')) {
+      own.timeout = Number.parseInt(arg.slice('--timeout='.length), 10);
+      if (!Number.isFinite(own.timeout) || own.timeout <= 0) fail('--timeout must be a positive integer (ms)');
+      continue;
+    }
+    if (arg.startsWith('--name=')) { own.name = arg.slice('--name='.length); continue; }
+
+    // Everything below is OpenRDAP territory.
+    const flagName = arg.startsWith('--') ? arg.split('=')[0] : arg;
+
+    if (OUTPUT_FORMAT_FLAGS.has(flagName)) continue; // dropped; JSON is forced
+
+    if (arg.startsWith('-')) {
+      passthrough.push(arg);
+      if (!arg.includes('=') && VALUE_FLAGS.has(flagName)) {
+        const value = argv[++i];
+        if (value === undefined) fail(`${arg} requires a value`);
+        passthrough.push(value);
+      }
+      continue;
+    }
+
+    positionals.push(arg);
+  }
+
+  // The final non-flag argument is the name; any earlier positionals are
+  // handed to openrdap untouched.
+  if (!own.name && positionals.length > 0) own.name = positionals.pop();
+  passthrough.push(...positionals);
+
+  if (!own.name) {
+    process.stderr.write(usage);
+    fail('no name given');
+  }
+
+  return { own, passthrough };
+}
+
+// --- helpers ----------------------------------------------------------------
+
+async function fetchJson(url, timeoutMs) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`);
+  return response.json();
+}
+
+async function dig(args, timeoutMs) {
+  const secs = Math.max(1, Math.ceil(timeoutMs / 1000));
+  const { stdout } = await run(DIG, [`+time=${secs}`, '+tries=1', ...args], {
+    timeout: timeoutMs + 1000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+async function digLines(name, type, server, timeoutMs) {
+  const args = [...(server ? [`@${server}`, '-p', '5354'] : []), '+short', name, type];
+  const out = await dig(args, timeoutMs);
+  return out.split('\n').map((l) => l.trim()).filter(Boolean);
+}
+
+function tcpOpen(port, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    const done = (open) => { socket.destroy(); resolve(open); };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+async function findRdapBinary() {
+  const candidates = [
+    path.join(os.homedir(), 'go', 'bin', 'rdap'),
+    'rdap',
+    'openrdap',
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (candidate.includes(path.sep)) await access(candidate, constants.X_OK);
+      else await run('which', [candidate]);
+      return candidate;
+    } catch { /* keep looking */ }
+  }
+  return null;
+}
+
+// --- moshpit ----------------------------------------------------------------
+
+// The registry paginates TLDs at 1000 per page; pull every page and return a
+// Set of endings. Any failure means "treat as non-moshpit".
+async function fetchPitTlds(registry, timeoutMs) {
+  const first = await fetchJson(`${registry}/api/moshpit/tlds?limit=1000&offset=0`, timeoutMs);
+  const entries = [...(first.tlds ?? [])];
+  const total = first.total ?? entries.length;
+
+  const pages = [];
+  for (let offset = entries.length; offset < total; offset += 1000) {
+    pages.push(
+      fetchJson(`${registry}/api/moshpit/tlds?limit=1000&offset=${offset}`, timeoutMs)
+        .then((page) => entries.push(...(page.tlds ?? []))),
+    );
+  }
+  await Promise.all(pages);
+
+  return new Set(entries.map((e) => (typeof e === 'string' ? e : e.tld)).filter(Boolean));
+}
+
+async function moshpitSection(registry, name, timeoutMs) {
+  const qs = `name=${encodeURIComponent(name)}`;
+  const [resolve, pins] = await Promise.all([
+    fetchJson(`${registry}/api/moshpit/resolve?${qs}&records=1`, timeoutMs),
+    fetchJson(`${registry}/api/moshpit/pins?${qs}`, timeoutMs).catch(() => null),
+  ]);
+  return { ...resolve, pins: pins?.pins ?? [] };
+}
+
+// --- rdap -------------------------------------------------------------------
+
+async function rdapSection(binary, passthrough, name, timeoutMs) {
+  try {
+    const { stdout } = await run(binary, [...passthrough, '--json', name], {
+      timeout: Math.max(timeoutMs * 4, 30000),
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return JSON.parse(stdout);
+  } catch (error) {
+    const detail = error.stderr?.trim() || error.message;
+    return { error: `openrdap failed: ${detail}` };
+  }
+}
+
+// --- dns --------------------------------------------------------------------
+
+async function dnsSection(name, timeoutMs, moshpitData) {
+  const section = { records: {}, hosts: [], reverse: [], axfr: [] };
+
+  // Moshpit names resolve through the local bridge on 127.0.0.1:5354 when it
+  // is up; otherwise fall back to whatever the registry API returned.
+  const bridge = moshpitData ? await tcpOpen(5354, Math.min(timeoutMs, 1500)) : false;
+  const server = bridge ? '127.0.0.1' : null;
+
+  if (moshpitData && !bridge) {
+    // No bridge: dig cannot see moshpit endings, so records and hosts come
+    // from the registry resolve response (target + A/AAAA-style records).
+    const records = moshpitData.records;
+    if (records && typeof records === 'object') {
+      for (const type of RECORD_TYPES) {
+        const values = records[type] ?? records[type.toLowerCase()];
+        if (Array.isArray(values) && values.length > 0) section.records[type] = values.map(String);
+      }
+    }
+    const hosts = new Set();
+    if (typeof moshpitData.target === 'string' && moshpitData.target) hosts.add(moshpitData.target);
+    for (const value of section.records.A ?? []) hosts.add(value);
+    for (const value of section.records.AAAA ?? []) hosts.add(value);
+    section.hosts = [...hosts];
+  } else {
+    // One query per type, deliberately not ANY: authoritative servers are
+    // allowed to answer ANY with a minimal subset.
+    const answers = await Promise.all(
+      RECORD_TYPES.map(async (type) => {
+        try {
+          return [type, await digLines(name, type, server, timeoutMs)];
+        } catch {
+          return [type, []];
+        }
+      }),
+    );
+    for (const [type, lines] of answers) {
+      if (lines.length > 0) section.records[type] = lines;
+    }
+    section.hosts = [...new Set([...(section.records.A ?? []), ...(section.records.AAAA ?? [])])];
+  }
+
+  // Reverse lookup for every resolved address.
+  section.reverse = await Promise.all(
+    section.hosts.map(async (address) => {
+      try {
+        const out = await dig([...(server ? [`@${server}`, '-p', '5354'] : []), '+short', '-x', address], timeoutMs);
+        const ptr = out.split('\n').map((l) => l.trim()).filter(Boolean);
+        return { address, ptr };
+      } catch {
+        return { address, ptr: [] };
+      }
+    }),
+  );
+
+  // AXFR against each authoritative nameserver; refusal is data, not failure.
+  for (const ns of section.records.NS ?? []) {
+    const host = ns.replace(/\.$/, '');
+    const entry = { ns: host, transfer: 'failed' };
+    try {
+      const out = await dig([`@${host}`, name, 'AXFR'], timeoutMs);
+      if (/status:\s*REFUSED/i.test(out)) entry.transfer = 'refused';
+      else if (/XFR size:/i.test(out)) {
+        entry.transfer = 'ok';
+        entry.lines = out.split('\n').filter((l) => l.trim() && !l.startsWith(';')).length;
+      }
+    } catch { /* stays "failed" */ }
+    section.axfr.push(entry);
+  }
+
+  return section;
+}
+
+// --- main -------------------------------------------------------------------
+
+async function main() {
+  const { own, passthrough } = parseArgs(process.argv.slice(2));
+  const name = own.name.toLowerCase();
+  const out = { name };
+
+  let moshpitData = null;
+  let registryNote = null;
+
+  try {
+    const tlds = await fetchPitTlds(own.registry, own.timeout);
+    const ending = name.includes('.') ? name.split('.').pop() : null;
+    if (ending && tlds.has(ending)) {
+      moshpitData = await moshpitSection(own.registry, name, own.timeout);
+      out.moshpit = moshpitData;
+    }
+  } catch (error) {
+    // Registry unreachable: carry on as a plain RDAP+DNS lookup.
+    registryNote = `moshpit registry unavailable: ${error.message}`;
+  }
+
+  if (!moshpitData) {
+    const binary = await findRdapBinary();
+    if (binary) {
+      out.rdap = await rdapSection(binary, passthrough, name, own.timeout);
+    } else {
+      out.rdap = { error: 'openrdap CLI not found (looked for ~/go/bin/rdap, rdap, openrdap on PATH)' };
+    }
+    if (registryNote) out.rdap.note = registryNote;
+  }
+
+  out.dns = await dnsSection(name, own.timeout, moshpitData);
+
+  const rdapOk = out.rdap && !out.rdap.error;
+  const moshpitOk = Boolean(out.moshpit);
+  const dnsOk = Object.keys(out.dns.records).length > 0 || out.dns.hosts.length > 0;
+
+  if (!rdapOk && !moshpitOk && !dnsOk) {
+    out.error = 'every data source failed (moshpit, rdap, dns)';
+    process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+    process.exit(1);
+  }
+
+  process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+}
+
+main().catch((error) => fail(error.message, 1));
