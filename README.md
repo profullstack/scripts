@@ -98,6 +98,52 @@ exit status is non-zero and the JSON carries an `error` key.
 | `--timeout MS` | per-query timeout for HTTP and dig, default 4000 |
 | `--name NAME` | alternative to the positional name argument |
 
+### `provision-ssh-keys`
+
+Authorizes our public keys on a machine, so every box we buy is reachable
+without a password. **Dry run by default** — nothing is written until you pass
+`--apply`. Idempotent, so it doubles as a drift check on hosts we already own.
+
+```sh
+provision-ssh-keys 152.53.47.37                  # report only
+provision-ssh-keys --apply 152.53.47.37          # install
+provision-ssh-keys --apply --user anthony box    # into a non-root account
+```
+
+Every `~/.ssh/*.pub` is installed unless you narrow it with `--key`. Only `.pub`
+files are accepted; the script refuses anything else, so a private key cannot be
+shipped by a slip of the shell.
+
+**The first key is a chicken-and-egg and this script will not solve it.** A
+machine that has never seen one of our keys answers `Permission denied
+(publickey,password)`, and nothing here handles passwords. Bootstrap one key
+through the provider's own provisioning — netcup SCP, cloud-init, a rescue
+console — or interactively, once, with `ssh-copy-id -i ~/.ssh/id_ed25519.pub
+root@HOST`. After that this script converges the rest and re-converges later.
+
+**Host keys.** By default an unknown host is refused rather than trusted;
+`--accept-new` waives that. Better, pass `--fingerprint` with the value read off
+the provider's console and the script verifies before it opens a session,
+refusing on mismatch:
+
+```sh
+provision-ssh-keys --apply --fingerprint SHA256:AUyILK… 152.53.47.37
+```
+
+A reinstalled machine legitimately presents new host keys, so a mismatch means
+*go re-read the console*, not necessarily an attack. It is still a stop.
+
+Options:
+
+| Flag | Effect |
+| --- | --- |
+| `--user USER` | Remote account to install into; default `root` |
+| `--port N` | SSH port; default 22 |
+| `--key PATH` | Public key to install; repeatable. Default: every `~/.ssh/*.pub` |
+| `--fingerprint SHA256:…` | Require the host to present this key; repeatable |
+| `--accept-new` | Trust an unknown host key instead of refusing |
+| `--apply` | Actually write `authorized_keys` |
+
 ## `wrappers/`
 
 Snapshots of the launcher scripts that third-party installers drop into
@@ -124,6 +170,8 @@ an installer is unavailable and you need the old contents back.
 
 ## Requirements
 
-`gh` (authenticated), `jq`, and `awk`. `domainjson` additionally wants `node`,
+`gh` (authenticated), `jq`, and `awk`. `provision-ssh-keys` needs only OpenSSH
+(`ssh`, `ssh-keyscan`, `ssh-keygen`) locally and `bash` on the remote host.
+`domainjson` additionally wants `node`,
 `dig`, and the OpenRDAP CLI (`go install github.com/openrdap/rdap/cmd/rdap@latest`,
 run from `~/go/bin/rdap` or on `PATH`).

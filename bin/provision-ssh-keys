@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+user=root
+port=22
+apply=0
+accept_new=0
+keys=()
+fingerprints=()
+hosts=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  provision-ssh-keys [options] HOST [HOST...]
+
+Authorizes our public keys on a machine, so every box we buy is reachable
+without a password. Idempotent: a key already present is left alone.
+
+By default, this performs a dry run.
+
+Options:
+  --user USER            Remote account to install into; default root
+  --port N               SSH port; default 22
+  --key PATH             Public key to install; repeatable.
+                         Default: every ~/.ssh/*.pub
+  --fingerprint SHA256:… Require the host to present this key before we talk to
+                         it; repeatable. Read them off the provider's console.
+  --accept-new           Trust an unknown host key instead of refusing
+  --apply                Actually write authorized_keys
+  -h, --help             Show this help
+
+The first key cannot be installed this way. A machine that has never seen one of
+our keys refuses with "Permission denied (publickey,password)", and this script
+never handles passwords. Bootstrap one key through the provider's provisioning
+(netcup SCP, cloud-init, rescue console) or interactively with:
+
+  ssh-copy-id -i ~/.ssh/id_ed25519.pub root@HOST
+
+then run this to converge the rest and to re-converge later.
+
+Examples:
+  provision-ssh-keys 152.53.47.37
+  provision-ssh-keys --apply 152.53.47.37
+  provision-ssh-keys --apply --fingerprint SHA256:AUyILK… 152.53.47.37
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user)        user=${2-}; shift 2 ;;
+    --port)        port=${2-}; shift 2 ;;
+    --key)         keys+=("${2-}"); shift 2 ;;
+    --fingerprint) fingerprints+=("${2-}"); shift 2 ;;
+    --accept-new)  accept_new=1; shift ;;
+    --apply)       apply=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -*)            printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+    *)             hosts+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#hosts[@]} -eq 0 ]; then
+  printf 'no host given\n\n' >&2
+  usage >&2
+  exit 2
+fi
+
+if [ ${#keys[@]} -eq 0 ]; then
+  for pub in "$HOME"/.ssh/*.pub; do
+    [ -e "$pub" ] && keys+=("$pub")
+  done
+fi
+
+if [ ${#keys[@]} -eq 0 ]; then
+  printf 'no public keys found in %s/.ssh\n' "$HOME" >&2
+  exit 1
+fi
+
+key_lines=()
+for pub in "${keys[@]}"; do
+  if [ ! -r "$pub" ]; then
+    printf 'cannot read %s\n' "$pub" >&2
+    exit 1
+  fi
+  case "$pub" in
+    *.pub) ;;
+    *) printf 'refusing %s: not a .pub file, and private keys never leave this machine\n' "$pub" >&2; exit 1 ;;
+  esac
+  line=$(tr -d '\r' <"$pub" | sed -n '1p')
+  if [ -z "$line" ]; then
+    printf 'refusing %s: empty\n' "$pub" >&2
+    exit 1
+  fi
+  key_lines+=("$line")
+  printf 'key   %s  %s\n' "$(ssh-keygen -lf "$pub" 2>/dev/null | awk '{print $2}')" "$pub"
+done
+
+# Refuse to talk to a host presenting a key we were not told to expect. A
+# reinstalled machine legitimately changes host keys, so this is a prompt to
+# re-read the console, not an assumption of attack.
+verify_fingerprints() {
+  local host=$1 seen matched fp
+  seen=$(ssh-keyscan -p "$port" -t ed25519,ecdsa,rsa "$host" 2>/dev/null | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+  if [ -z "$seen" ]; then
+    printf '  host key: no response from %s:%s\n' "$host" "$port"
+    return 1
+  fi
+  matched=0
+  for fp in "${fingerprints[@]}"; do
+    if printf '%s\n' "$seen" | grep -qxF -- "$fp"; then
+      matched=1
+    else
+      printf '  host key: expected %s, host does not present it\n' "$fp"
+    fi
+  done
+  if [ "$matched" -eq 0 ]; then
+    printf '  host key: MISMATCH, refusing. Host presents:\n'
+    printf '%s\n' "$seen" | sed 's/^/    /'
+    return 1
+  fi
+  printf '  host key: verified\n'
+  return 0
+}
+
+remote_script() {
+  cat <<'PRELUDE'
+set -u
+umask 077
+ak_dir="$HOME/.ssh"
+ak="$ak_dir/authorized_keys"
+mkdir -p "$ak_dir"
+chmod 700 "$ak_dir"
+[ -e "$ak" ] || : >"$ak"
+chmod 600 "$ak"
+added=0
+present=0
+label() {
+  # ssh-ed25519 AAAA…blob comment  ->  ssh-ed25519 …last12 comment
+  set -- $1
+  printf '%s …%s %s' "$1" "$(printf '%s' "$2" | tail -c 12)" "${3-}"
+}
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  if grep -qxF -- "$key" "$ak"; then
+    present=$((present + 1))
+    printf '  present   %s\n' "$(label "$key")"
+  elif [ "$APPLY" = 1 ]; then
+    printf '%s\n' "$key" >>"$ak"
+    added=$((added + 1))
+    printf '  added     %s\n' "$(label "$key")"
+  else
+    added=$((added + 1))
+    printf '  would add %s\n' "$(label "$key")"
+  fi
+done <<'KEYS'
+PRELUDE
+  printf '%s\n' "${key_lines[@]}"
+  cat <<'EPILOGUE'
+KEYS
+printf '  %s: %d to add, %d already present\n' "$(hostname)" "$added" "$present"
+EPILOGUE
+}
+
+rc=0
+for host in "${hosts[@]}"; do
+  printf '\n%s@%s:%s\n' "$user" "$host" "$port"
+
+  strict=yes
+  [ "$accept_new" -eq 1 ] && strict=accept-new
+
+  if [ ${#fingerprints[@]} -gt 0 ]; then
+    if ! verify_fingerprints "$host"; then
+      rc=1
+      continue
+    fi
+    # Pinned by fingerprint, so the key is ours to trust regardless of --accept-new.
+    ssh-keyscan -p "$port" -H "$host" 2>/dev/null >>"$HOME/.ssh/known_hosts"
+    strict=yes
+  fi
+
+  if ! remote_script | ssh \
+      -o BatchMode=yes \
+      -o StrictHostKeyChecking="$strict" \
+      -o ConnectTimeout=10 \
+      -p "$port" "$user@$host" "APPLY=$apply bash -s"; then
+    printf '  unreachable, or no key of ours is authorized yet — see --help on bootstrapping the first one\n'
+    rc=1
+  fi
+done
+
+if [ "$apply" -eq 0 ]; then
+  printf '\ndry run — nothing was written. Pass --apply.\n'
+fi
+
+exit "$rc"
