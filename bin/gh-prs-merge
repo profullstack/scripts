@@ -7,7 +7,7 @@ limit=1000
 apply=0
 allow_no_checks=0
 ready_drafts=1
-fix=0
+fix=auto
 fix_wait=600
 
 usage() {
@@ -25,15 +25,21 @@ Options:
   --apply                Actually squash-merge eligible PRs
   --allow-no-checks      Also merge clean PRs that have no CI checks
   --no-ready-drafts      Ignore draft PRs instead of marking them ready
-  --fix                  Repair mechanical blockers, then re-evaluate
-  --fix-wait SECONDS     How long --fix waits on running checks; default 600
+  --no-fix               With --apply, repair nothing; judge each PR as it is
+  --fix-wait SECONDS     How long a repair waits on running checks; default 600
   -h, --help             Show this help
 
-Fixing (--fix):
+Fixing (what --apply does; turn it off with --no-fix):
   A skip is not always a verdict on the PR. Some are the tool arriving at the
-  wrong moment, and re-running by hand is the same work a second time. With
-  --fix each repairable skip is repaired once, then the PR is judged again
-  against the identical rules. Requires --apply, since every repair writes.
+  wrong moment, and re-running by hand is the same work a second time. So a run
+  that merges repairs each repairable skip once, then judges the PR again
+  against the identical rules.
+
+  This is part of --apply rather than a flag of its own because --apply already
+  squash-merges: asking GitHub to update a branch first is not a new kind of
+  write, and nothing has to opt in to get it. A dry run never repairs, since
+  every repair writes. --fix is still accepted, and names the default, so an
+  alias or script that already passes it keeps working.
 
   Repaired:
     checks still running   Waits for them to settle, up to --fix-wait, then
@@ -179,8 +185,15 @@ done
 [[ $fix_wait =~ ^[0-9]+$ ]] ||
   die '--fix-wait must be a non-negative integer'
 
-# --fix without --apply would be a dry run that writes to every repairable PR,
-# which is the one thing a dry run promises not to do.
+# Unset means: repair when we are merging, never when we are only reporting.
+# Resolved here rather than at the declaration because it follows --apply,
+# which the caller may pass after --no-fix.
+if [[ $fix == auto ]]; then
+  fix=$apply
+fi
+
+# An explicit --fix in a dry run is a contradiction rather than a default:
+# every repair writes, and not writing is the one thing a dry run promises.
 if ((fix && apply == 0)); then
   die '--fix requires --apply'
 fi
