@@ -7,6 +7,8 @@ limit=1000
 apply=0
 allow_no_checks=0
 ready_drafts=1
+fix=0
+fix_wait=600
 
 usage() {
   cat <<'EOF'
@@ -23,7 +25,36 @@ Options:
   --apply                Actually squash-merge eligible PRs
   --allow-no-checks      Also merge clean PRs that have no CI checks
   --no-ready-drafts      Ignore draft PRs instead of marking them ready
+  --fix                  Repair mechanical blockers, then re-evaluate
+  --fix-wait SECONDS     How long --fix waits on running checks; default 600
   -h, --help             Show this help
+
+Fixing (--fix):
+  A skip is not always a verdict on the PR. Some are the tool arriving at the
+  wrong moment, and re-running by hand is the same work a second time. With
+  --fix each repairable skip is repaired once, then the PR is judged again
+  against the identical rules. Requires --apply, since every repair writes.
+
+  Repaired:
+    checks still running   Waits for them to settle, up to --fix-wait, then
+                           re-reads. This is the most common false skip:
+                           mergeStateStatus is UNSTABLE or BLOCKED only
+                           because a check has not reported yet. Nothing is
+                           wrong with the PR and nothing needs changing.
+    mergeStateStatus=BEHIND
+                           Asks GitHub to merge the base branch in, then waits
+                           for the checks that re-run against the new head.
+    mergeable=CONFLICTING  Same request. It succeeds when the base merely moved
+                           underneath the branch, which GitHub can reconcile on
+                           its own.
+
+  Never repaired:
+    A conflict GitHub declines to merge is left alone, and the message it gave
+    is printed. Resolving one means choosing between two authors' intent, and a
+    batch tool that guesses would produce a merge nobody wrote and nobody
+    reviewed. The same goes for a check that ran and failed: it is a result,
+    not an obstacle, and retrying until it passes is how a flaky suite becomes
+    a green one that means nothing.
 
 Drafts:
   Draft PRs are included by default. With --apply they are marked ready for
@@ -102,6 +133,27 @@ while (($#)); do
       shift
       ;;
 
+    --fix)
+      fix=1
+      shift
+      ;;
+
+    --no-fix)
+      fix=0
+      shift
+      ;;
+
+    --fix-wait)
+      (($# >= 2)) || die '--fix-wait requires a number of seconds'
+      fix_wait=$2
+      shift 2
+      ;;
+
+    --fix-wait=*)
+      fix_wait=${1#*=}
+      shift
+      ;;
+
     -h|--help)
       usage
       exit 0
@@ -123,6 +175,15 @@ done
 
 ((limit <= 1000)) ||
   die '--limit cannot exceed 1000'
+
+[[ $fix_wait =~ ^[0-9]+$ ]] ||
+  die '--fix-wait must be a non-negative integer'
+
+# --fix without --apply would be a dry run that writes to every repairable PR,
+# which is the one thing a dry run promises not to do.
+if ((fix && apply == 0)); then
+  die '--fix requires --apply'
+fi
 
 org_list=()
 user_list=()
@@ -215,6 +276,9 @@ if ((apply)); then
   else
     echo 'MODE: APPLY — eligible PRs will be squash-merged.'
   fi
+
+  ((fix)) &&
+    echo 'MODE: FIX — repairable blockers will be repaired once, then re-judged.'
 else
   echo 'MODE: DRY RUN — nothing will be merged. Add --apply to merge.'
 fi
@@ -224,6 +288,7 @@ ready=0
 readied=0
 skipped=0
 failed=0
+fixed=0
 
 # Populates $metadata for a PR, retrying while GitHub is still computing
 # state. Pass a second argument to also wait for a just-readied PR to stop
@@ -265,6 +330,150 @@ parse_metadata() {
   title=$(
     jq -r '.title | gsub("[\r\n\t]+"; " ")' <<< "$metadata"
   )
+}
+
+# Populates the check tallies the eligibility rules read.
+#
+# `gh pr checks` exits nonzero when anything is pending or failing while still
+# printing valid JSON, so the buckets are evaluated directly rather than the
+# exit code.
+collect_checks() {
+  local pr=$1
+  local checks_output=''
+
+  checks='[]'
+
+  checks_output=$(
+    GH_PAGER=cat gh pr checks "$pr" \
+      --json bucket,name 2>/dev/null
+  ) || true
+
+  if [[ -n $checks_output ]] &&
+     jq -e 'type == "array"' >/dev/null 2>&1 <<< "$checks_output"
+  then
+    checks=$checks_output
+  fi
+
+  check_count=$(jq 'length' <<< "$checks")
+
+  bad_checks=$(
+    jq '
+      [
+        .[]
+        | select(
+            .bucket != "pass" and
+            .bucket != "skipping"
+          )
+      ]
+      | length
+    ' <<< "$checks"
+  )
+
+  # Tracked apart from bad_checks because the two want opposite treatment: a
+  # pending check is a reason to wait, a failing one is a reason to stop.
+  pending_checks=$(
+    jq '[.[] | select(.bucket == "pending")] | length' <<< "$checks"
+  )
+
+  bad_check_names=$(
+    jq -r '
+      [
+        .[]
+        | select(
+            .bucket != "pass" and
+            .bucket != "skipping"
+          )
+        | "\(.name)=\(.bucket)"
+      ]
+      | join(", ")
+    ' <<< "$checks"
+  )
+}
+
+# The eligibility rules, in one place so --fix can re-run them unchanged.
+compute_reason() {
+  reason=''
+
+  if [[ $state != OPEN ]]; then
+    reason="state=$state"
+  elif [[ $draft == true ]]; then
+    reason='draft'
+  elif [[ $mergeable != MERGEABLE ]]; then
+    reason="mergeable=$mergeable"
+  elif [[ $merge_state != CLEAN ]]; then
+    reason="mergeStateStatus=$merge_state"
+  elif ((check_count == 0 && allow_no_checks == 0)); then
+    reason='no CI checks found'
+  elif ((bad_checks > 0)); then
+    reason="checks not green: $bad_check_names"
+  fi
+}
+
+# Blocks while any check is still running, up to --fix-wait.
+#
+# Returns 0 if the checks finished within the budget, 1 on timeout. Either way
+# the caller re-reads state; a timeout is not a failure of the PR, only of our
+# patience, and it should still be reported with whatever the real reason is.
+wait_for_checks() {
+  local pr=$1
+  local waited=0
+
+  while ((pending_checks > 0 && waited < fix_wait)); do
+    printf '      … %s check(s) still running on %s; waiting\n' \
+      "$pending_checks" "$pr"
+    sleep 20
+    waited=$((waited + 20))
+    collect_checks "$pr"
+  done
+
+  ((pending_checks == 0))
+}
+
+# Attempts one repair of a repairable skip.
+#
+# Returns 0 when something was done and the PR deserves a second look, 1 when
+# the reason is not one this should touch.
+attempt_fix() {
+  local pr=$1
+  local update_output=''
+
+  # Checks still running. The PR is not blocked, it is unfinished, and the
+  # only defect is that we looked too early.
+  if ((pending_checks > 0)); then
+    printf 'FIXING %s — checks still running; waiting up to %ss\n' \
+      "$pr" "$fix_wait"
+    wait_for_checks "$pr"
+    return 0
+  fi
+
+  # Base branch moved. GitHub can merge it in without a local checkout, and
+  # does so only when the result needs no human judgement.
+  if [[ $merge_state == BEHIND ||
+        $merge_state == DIRTY ||
+        $mergeable == CONFLICTING ]]
+  then
+    printf 'FIXING %s — %s; asking GitHub to merge the base branch in\n' \
+      "$pr" "$reason"
+
+    if update_output=$(
+      GH_PAGER=cat gh pr update-branch "$pr" 2>&1
+    ); then
+      # New head, so every check re-runs. Waiting here is what makes the fix
+      # worth anything — otherwise the re-check sees a pending suite and skips
+      # for the very reason we just set in motion.
+      collect_checks "$pr"
+      wait_for_checks "$pr"
+      return 0
+    fi
+
+    # A real conflict. Print what GitHub said and leave it: choosing between
+    # two authors' intent is not a batch operation.
+    printf 'FIXME %s — GitHub could not merge the base in: %s\n' \
+      "$pr" "$(tr '\n' ' ' <<< "$update_output")" >&2
+    return 1
+  fi
+
+  return 1
 }
 
 for pr in "${prs[@]}"; do
@@ -312,65 +521,26 @@ for pr in "${prs[@]}"; do
     fi
   fi
 
-  checks='[]'
-  checks_output=''
+  collect_checks "$pr"
+  compute_reason
 
-  # gh pr checks may exit nonzero for pending/failed checks while still
-  # returning JSON, so evaluate the JSON buckets directly.
-  checks_output=$(
-    GH_PAGER=cat gh pr checks "$pr" \
-      --json bucket,name 2>/dev/null
-  ) || true
+  # One repair attempt, then the same rules decide again. Deliberately not a
+  # loop: if a repair did not make the PR mergeable, repeating it will not
+  # either, and a tool that keeps trying is how a batch run turns into an
+  # afternoon of API calls.
+  if [[ -n $reason ]] && ((fix)); then
+    if attempt_fix "$pr"; then
+      ((fixed += 1))
+      fetch_metadata "$pr"
 
-  if [[ -n $checks_output ]] &&
-     jq -e 'type == "array"' >/dev/null 2>&1 <<< "$checks_output"
-  then
-    checks=$checks_output
-  fi
-
-  check_count=$(jq 'length' <<< "$checks")
-
-  bad_checks=$(
-    jq '
-      [
-        .[]
-        | select(
-            .bucket != "pass" and
-            .bucket != "skipping"
-          )
-      ]
-      | length
-    ' <<< "$checks"
-  )
-
-  bad_check_names=$(
-    jq -r '
-      [
-        .[]
-        | select(
-            .bucket != "pass" and
-            .bucket != "skipping"
-          )
-        | "\(.name)=\(.bucket)"
-      ]
-      | join(", ")
-    ' <<< "$checks"
-  )
-
-  reason=''
-
-  if [[ $state != OPEN ]]; then
-    reason="state=$state"
-  elif [[ $draft == true ]]; then
-    reason='draft'
-  elif [[ $mergeable != MERGEABLE ]]; then
-    reason="mergeable=$mergeable"
-  elif [[ $merge_state != CLEAN ]]; then
-    reason="mergeStateStatus=$merge_state"
-  elif ((check_count == 0 && allow_no_checks == 0)); then
-    reason='no CI checks found'
-  elif ((bad_checks > 0)); then
-    reason="checks not green: $bad_check_names"
+      if [[ -n $metadata ]] &&
+         jq -e 'type == "object"' >/dev/null 2>&1 <<< "$metadata"
+      then
+        parse_metadata
+        collect_checks "$pr"
+        compute_reason
+      fi
+    fi
   fi
 
   if [[ -n $reason ]]; then
@@ -399,5 +569,5 @@ for pr in "${prs[@]}"; do
   fi
 done
 
-printf '\nSummary: ready=%d readied=%d merged=%d skipped=%d failed=%d\n' \
-  "$ready" "$readied" "$merged" "$skipped" "$failed"
+printf '\nSummary: ready=%d readied=%d fixed=%d merged=%d skipped=%d failed=%d\n' \
+  "$ready" "$readied" "$fixed" "$merged" "$skipped" "$failed"
