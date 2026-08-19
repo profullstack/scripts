@@ -98,6 +98,54 @@ exit status is non-zero and the JSON carries an `error` key.
 | `--timeout MS` | per-query timeout for HTTP and dig, default 4000 |
 | `--name NAME` | alternative to the positional name argument |
 
+### `domainfree`
+
+Bulk domain availability, straight from the registry. Prints only the names you
+can actually buy, one per line, so it pipes into anything.
+
+```sh
+domainfree sorrycheck.com sinkstate.com
+domainfree -f candidates.txt
+generate-names | domainfree --jobs 24
+domainfree --all example.com          # show TAKEN rows too
+```
+
+Availability is read from **RDAP, never inferred from DNS**, because DNS cannot
+tell registration apart from configuration:
+
+- A parked domain resolves fine and is taken.
+- A registered domain with no nameservers returns `NXDOMAIN` — identical to a
+  name nobody owns.
+
+Checked against 8,513 generated candidates, the DNS shortcut (`dig NAME | grep
+"ANSWER: 0"`) reported 20 registered domains as free while missing none that
+were genuinely free. `oubliette.com` is the instructive one: registered in 1996,
+paid through 2034, three nameservers, no `A` record — so `dig` says `ANSWER: 0`
+and reads as available. Fine as a cheap prefilter, useless as a buy signal.
+
+Lookups run in parallel (16 by default; 8,500 names take about 45 seconds).
+Anything indeterminate — a 429, a 5xx, a timeout — is retried once serially and
+then reported as `ERR:<code>`, and the exit status is `2` so an unknown is never
+silently read as available.
+
+| Flag | Effect |
+| --- | --- |
+| `-f, --file FILE` | read names from FILE, one per line (`-` for stdin) |
+| `-j, --jobs N` | parallel lookups, default 16 |
+| `-t, --timeout S` | per-lookup timeout in seconds, default 20 |
+| `-a, --all` | print every name as `STATUS domain`, not just the free ones |
+| `-q, --quiet` | suppress the summary, which is written to stderr |
+
+The summary goes to stderr and the names to stdout, so `domainfree -f in.txt |
+wc -l` counts what you can buy. For a deep look at one name rather than a
+verdict across thousands, use `domainjson`.
+
+Single name, in the shape of the familiar `dig` one-liner:
+
+```sh
+curl -sfL -o /dev/null https://rdap.verisign.com/com/v1/domain/NAME && echo "not available"
+```
+
 ## `wrappers/`
 
 Snapshots of the launcher scripts that third-party installers drop into
@@ -124,6 +172,6 @@ an installer is unavailable and you need the old contents back.
 
 ## Requirements
 
-`gh` (authenticated), `jq`, and `awk`. `domainjson` additionally wants `node`,
-`dig`, and the OpenRDAP CLI (`go install github.com/openrdap/rdap/cmd/rdap@latest`,
+`gh` (authenticated), `jq`, and `awk`. `domainfree` needs only `curl`.
+`domainjson` additionally wants `node`, `dig`, and the OpenRDAP CLI (`go install github.com/openrdap/rdap/cmd/rdap@latest`,
 run from `~/go/bin/rdap` or on `PATH`).

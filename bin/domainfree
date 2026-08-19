@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# domainfree — bulk domain availability, straight from the registry.
+#
+# Prints only names that are genuinely unregistered. Availability is read from
+# RDAP, never inferred from DNS: a parked domain resolves but is taken, and a
+# registered domain with no nameservers returns NXDOMAIN exactly like a free
+# one. DNS cannot tell registration apart from configuration; the registry can.
+#
+# Companion to `domainjson`, which does a deep lookup of a single name.
+# This one answers one question across thousands: can I buy it?
+
+set -uo pipefail
+
+JOBS=16
+TIMEOUT=20
+SHOW_ALL=0
+QUIET=0
+FILE=""
+
+usage() {
+  cat <<'EOF'
+domainfree — bulk domain availability from RDAP
+
+USAGE
+  domainfree example.com another.dev ...
+  domainfree -f candidates.txt
+  generate-names | domainfree
+
+OPTIONS
+  -f, --file FILE   read names from FILE, one per line ("-" for stdin)
+  -j, --jobs N      parallel lookups, default 16
+  -t, --timeout S   per-lookup timeout in seconds, default 20
+  -a, --all         print every name with its status, not just the free ones
+  -q, --quiet       suppress the trailing summary (on stderr)
+  -h, --help        this text
+
+OUTPUT
+  By default, one available domain per line — pipe it straight into anything.
+  With --all, each line is "STATUS domain" where STATUS is AVAILABLE, TAKEN,
+  or ERR:<code>.
+
+EXIT
+  0  ran to completion (even if nothing was available)
+  1  usage error
+  2  one or more lookups failed and their status is unknown
+
+NOTES
+  A single name, in the shape of the familiar dig one-liner:
+
+    curl -sfL -o /dev/null https://rdap.verisign.com/com/v1/domain/NAME && echo taken
+
+  Rate limits are retried once, serially, before being reported as ERR.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--file)    FILE="${2:-}"; shift 2 ;;
+    -j|--jobs)    JOBS="${2:-16}"; shift 2 ;;
+    -t|--timeout) TIMEOUT="${2:-20}"; shift 2 ;;
+    -a|--all)     SHOW_ALL=1; shift ;;
+    -q|--quiet)   QUIET=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; break ;;
+    -*)           echo "domainfree: unknown option $1" >&2; usage >&2; exit 1 ;;
+    *)            break ;;
+  esac
+done
+
+command -v curl >/dev/null || { echo "domainfree: curl is required" >&2; exit 1; }
+
+# ---------------------------------------------------------------- input
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+NAMES="$TMP/names"
+
+if [ -n "$FILE" ]; then
+  if [ "$FILE" = "-" ]; then cat; else cat "$FILE"; fi
+elif [ $# -gt 0 ]; then
+  printf '%s\n' "$@"
+elif [ ! -t 0 ]; then
+  cat
+else
+  usage >&2
+  exit 1
+fi | tr 'A-Z' 'a-z' | sed 's/[[:space:]]//g' | grep -E '^[a-z0-9.-]+\.[a-z]{2,}$' | sort -u > "$NAMES"
+
+TOTAL=$(wc -l < "$NAMES" | tr -d ' ')
+[ "$TOTAL" -eq 0 ] && { echo "domainfree: no valid names given" >&2; exit 1; }
+
+# ------------------------------------------------------------- lookup
+# Exported so the xargs subshell can call it.
+lookup() {
+  d="$1"
+  tld="${d##*.}"
+  case "$tld" in
+    com|net) url="https://rdap.verisign.com/$tld/v1/domain/$d" ;;
+    org)     url="https://rdap.publicinterestregistry.org/rdap/domain/$d" ;;
+    *)       url="https://rdap.org/domain/$d" ;;
+  esac
+  code=$(curl -sL -o /dev/null -w '%{http_code}' --max-time "$DF_TIMEOUT" "$url" 2>/dev/null)
+  case "$code" in
+    404) echo "AVAILABLE $d" ;;      # no registration record exists
+    200) echo "TAKEN $d" ;;          # registered: parked, dark or live, all taken
+    *)   echo "ERR:$code $d" ;;      # 429, 5xx, timeout — status unknown
+  esac
+}
+export -f lookup
+export DF_TIMEOUT="$TIMEOUT"
+
+RESULTS="$TMP/results"
+xargs -a "$NAMES" -P "$JOBS" -I{} bash -c 'lookup "$@"' _ {} > "$RESULTS"
+
+# Retry anything indeterminate once, serially — rate limiting is the usual cause
+# and it clears at low concurrency.
+RETRY="$TMP/retry"
+grep '^ERR:' "$RESULTS" | awk '{print $2}' > "$RETRY" || true
+if [ -s "$RETRY" ]; then
+  grep -v '^ERR:' "$RESULTS" > "$TMP/keep" || true
+  while read -r d; do
+    sleep 0.3
+    lookup "$d"
+  done < "$RETRY" >> "$TMP/keep"
+  mv "$TMP/keep" "$RESULTS"
+fi
+
+# ------------------------------------------------------------- output
+if [ "$SHOW_ALL" -eq 1 ]; then
+  sort -k1,1 -k2,2 "$RESULTS"
+else
+  awk '$1 == "AVAILABLE" { print $2 }' "$RESULTS" | sort
+fi
+
+AVAIL=$(grep -c '^AVAILABLE ' "$RESULTS" || true)
+TAKEN=$(grep -c '^TAKEN ' "$RESULTS" || true)
+UNKNOWN=$(grep -c '^ERR:' "$RESULTS" || true)
+
+if [ "$QUIET" -eq 0 ]; then
+  printf '%s checked · %s available · %s taken' "$TOTAL" "$AVAIL" "$TAKEN" >&2
+  [ "$UNKNOWN" -gt 0 ] && printf ' · %s unknown' "$UNKNOWN" >&2
+  printf '\n' >&2
+fi
+
+[ "$UNKNOWN" -gt 0 ] && exit 2
+exit 0
