@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# scripts-upgrade — move this box to the newest release of profullstack/scripts.
+#
+#   scripts-upgrade              # newest release tag
+#   scripts-upgrade --edge       # track main instead
+#   scripts-upgrade --ref v0.2.0 # a specific tag
+#   scripts-upgrade --dry-run    # what would change
+#   scripts-upgrade --status     # where this box is, and what is newest
+#
+# A thin front for install.sh in the checkout this command was symlinked out
+# of, so there is exactly one implementation of "fetch, move, relink" and it
+# is the one a fresh machine also runs. Arguments are passed straight through.
+
+set -euo pipefail
+
+# Resolve through the symlink in ~/.local/bin to find the checkout itself.
+# readlink -f is coreutils; the fallback covers a box where it is not.
+self="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null && readlink -f "$self" >/dev/null 2>&1; then
+  self="$(readlink -f "$self")"
+else
+  while [ -L "$self" ]; do self="$(readlink "$self")"; done
+fi
+root="$(cd "$(dirname "$self")/.." && pwd)"
+
+if [[ "${1:-}" == "--status" ]]; then
+  at="$(git -C "$root" describe --tags --always 2>/dev/null || echo unknown)"
+  branch="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  latest="$(git ls-remote --tags --refs origin 'v*' 2>/dev/null \
+    | awk '{print $2}' | sed 's#refs/tags/##' | sort -V | tail -1)"
+  printf '%-10s %s\n' checkout "$root"
+  printf '%-10s %s (%s)\n' at "$at" "$branch"
+  printf '%-10s %s\n' newest "${latest:-none published}"
+  dirty="$(git -C "$root" status --porcelain | wc -l)"
+  [[ "$dirty" -gt 0 ]] && printf '%-10s %s uncommitted file(s)\n' local "$dirty"
+  exit 0
+fi
+
+[[ -f "$root/install.sh" ]] || { echo "scripts-upgrade: no install.sh at $root" >&2; exit 1; }
+exec sh "$root/install.sh" "$@"

@@ -6,11 +6,53 @@ Hand-written command-line tools. Everything in `bin/` is meant to sit on `PATH`.
 
 ```sh
 git clone git@github.com:profullstack/scripts.git ~/scripts
-ln -sf ~/scripts/bin/* ~/.local/bin/
+sh ~/scripts/install.sh
 ```
 
-Symlinking rather than copying keeps `~/.local/bin` and this repo from drifting
-apart.
+The repo is private, so there is no anonymous `curl | sh`: the clone needs a key
+GitHub already knows. On a brand-new box that has to come first, which is the one
+chicken-and-egg here, since `provision-ssh-keys` is itself in this repo.
+
+`install.sh` clones (or updates) the checkout, moves it to the newest release
+tag, and symlinks every executable in `bin/` into `~/.local/bin`. Symlinking
+rather than copying keeps `~/.local/bin` and this repo from drifting apart.
+
+```sh
+sh install.sh                 # newest release
+sh install.sh --edge          # track main instead
+sh install.sh --ref v0.2.0    # a specific tag
+sh install.sh --dry-run       # say what would happen, change nothing
+```
+
+## Upgrading
+
+```sh
+scripts-upgrade               # move to the newest release
+scripts-upgrade --status      # where this box is, and what is newest
+scripts-upgrade --edge        # switch to tracking main
+```
+
+`scripts-upgrade` is a front for the same `install.sh`, so a fresh machine and
+an existing one run identical code.
+
+**Releases are the point of the tag, not a tarball.** Nothing downloads an
+archive from this repo; `install.sh` resolves the newest `v*` tag on the remote
+and checks the tree out at it. Cutting a release is therefore exactly:
+
+```sh
+git tag -a v0.2.0 -m "..." && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` takes it from there — it parses every script,
+checks the executable bits, runs `shellcheck -S error` over the shell ones, and
+only then publishes the GitHub release.
+
+**A development checkout is left alone.** Because `~/.local/bin/*` are symlinks
+into the working tree, the command on PATH is whatever the checkout is at, so
+tracking `main` means an unfinished edit is instantly the installed tool. That
+is why the default is a tag. The box where this repo is actually developed is
+the exception and needs no flag: a tree with uncommitted changes or unpushed
+commits is never moved, only re-symlinked.
 
 ## Tools
 
@@ -144,6 +186,29 @@ Options:
 | `--accept-new` | Trust an unknown host key instead of refusing |
 | `--apply` | Actually write `authorized_keys` |
 
+### `ssh-logins`
+
+Who actually got in over SSH, and from where. Defaults to today.
+
+```sh
+ssh-logins                # today
+ssh-logins yesterday      # any journalctl --since expression
+ssh-logins -7d
+ssh-logins --count        # one row per user+source
+ssh-logins --raw          # the original journal lines
+```
+
+No `sudo`. Membership in the `adm` group is enough to read the journal, so the
+command never stops to authenticate. Scoped to `-u ssh` because a full day is
+~15k lines and grepping all of them to find thirty is most of the runtime.
+
+Counts `Accepted` only. Failed and half-finished attempts are thousands a day on
+a public box and answer a different question.
+
+### `scripts-upgrade`
+
+Moves this box to the newest release of this repo. See [Upgrading](#upgrading).
+
 ## `wrappers/`
 
 Snapshots of the launcher scripts that third-party installers drop into
@@ -174,4 +239,8 @@ an installer is unavailable and you need the old contents back.
 (`ssh`, `ssh-keyscan`, `ssh-keygen`) locally and `bash` on the remote host.
 `domainjson` additionally wants `node`,
 `dig`, and the OpenRDAP CLI (`go install github.com/openrdap/rdap/cmd/rdap@latest`,
-run from `~/go/bin/rdap` or on `PATH`).
+run from `~/go/bin/rdap` or on `PATH`). `ssh-logins` needs `journalctl` and
+membership in a group that can read the journal (`adm` on Ubuntu).
+
+`install.sh` itself needs only POSIX `sh` and `git` — deliberately, since it is
+the one file that runs before anything else is installed.
