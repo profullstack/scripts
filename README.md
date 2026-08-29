@@ -114,6 +114,20 @@ gh-issues --users ralyodio
 gh-issues --orgs profullstack --users ralyodio --limit 50
 ```
 
+`--csv` writes the result set to `~/gh-issues-YYYY-MM-DD.csv` instead of
+printing the table, and `--csv=FILE` picks the path. The CSV is the archival
+form of the same query: whole titles rather than 70 columns of one, ISO 8601
+`CREATED` and `UPDATED` timestamps rather than "3 days ago", and a bare issue
+number so a spreadsheet reads it as one.
+
+```sh
+gh-issues --orgs profullstack,moshcoder,h4kr,infernetprotocol --csv
+gh-issues --orgs profullstack --csv=/tmp/issues.csv
+```
+
+Bare `--csv` takes no argument on purpose, so `--csv --limit 10` cannot swallow
+the next flag as a filename.
+
 ### `gh-prs-merge`
 
 Walks the same scopes and squash-merges every PR that qualifies, oldest first.
