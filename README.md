@@ -103,6 +103,17 @@ gh-prs --users ralyodio
 gh-prs --orgs profullstack --users ralyodio --limit 50
 ```
 
+### `gh-issues`
+
+The same table for open issues rather than pull requests. `gh search issues`
+excludes pull requests unless asked for them, so the two tools never overlap.
+
+```sh
+gh-issues --orgs profullstack,moshcoder,h4kr,infernetprotocol
+gh-issues --users ralyodio
+gh-issues --orgs profullstack --users ralyodio --limit 50
+```
+
 ### `gh-prs-merge`
 
 Walks the same scopes and squash-merges every PR that qualifies, oldest first.
