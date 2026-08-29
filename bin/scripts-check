@@ -4,20 +4,28 @@
 #   scripts-check          # check the checkout this command lives in
 #   scripts-check --quiet  # only complain
 #
-# This used to be a GitHub Actions workflow. It is not any more: an unpaid
-# balance on the profullstack org suspends Actions compute on private repos, so
-# the job was refused before it ever ran -- a red X with no logs, which reads
-# exactly like a broken workflow and is not one. A gate that does not run is
-# worse than no gate, because the red X implies something was checked.
+# This file is the rule, and everything else calls it. `.githooks/pre-push`
+# runs it before anything leaves the machine, and .github/workflows/release.yml
+# runs this same file on the runner rather than re-stating the checks in YAML —
+# which is what the two used to do, leaving CI and the hook free to drift.
+#
+# For a while there was no CI half at all. The workflow was deleted on
+# 2026-08-29, while the repo was private: an unpaid balance on the profullstack
+# org suspends Actions compute on private repos, so the job was refused before
+# it ever ran -- a red X with no logs, which reads exactly like a broken
+# workflow and is not one. A gate that does not run is worse than no gate,
+# because the red X implies something was checked.
 #
 # To be accurate about the money: this repo's CI minutes were never the cost.
 # They are covered by the included allowance at net $0.00. The balance is
-# Actions artifact storage and Code Quality credits on unrelated repos. Moving
-# the gate here saved nothing on the bill and was not meant to.
+# Actions artifact storage and Code Quality credits on unrelated repos, so
+# moving the gate here saved nothing on the bill and was not meant to. The
+# balance is still owed; the suspension just does not reach public repos, which
+# is why opening this one up brought CI back.
 #
-# So it runs here instead, and `.githooks/pre-push` runs it before every push.
-# Nothing about it needed a hosted runner: there is no build, no matrix, and
-# no secret. It is three loops over files that are already on disk.
+# Nothing here ever needed a hosted runner: no build, no matrix, no secret. It
+# is three loops over files that are already on disk, which is exactly why the
+# same three loops can run in both places at no cost.
 #
 # What it checks, and why each one:
 #

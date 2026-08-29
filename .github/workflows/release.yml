@@ -1,0 +1,63 @@
+# The release gate, and the release itself.
+#
+# This workflow existed before, was deleted on 2026-08-29, and is back. It was
+# never broken: profullstack is on the free plan, this repo was private, and
+# GitHub refused the job for billing before a runner was ever allocated. That
+# surfaces as a red X with no logs, which reads exactly like a broken workflow.
+# The repo is public now and Actions minutes are free on public repos, so the
+# job can actually run — which is the only thing that ever stopped it.
+#
+# The gate is `bin/scripts-check`, not a copy of it. The previous version of
+# this file inlined the same three loops in YAML, so CI and the local hook were
+# two implementations of one rule and free to drift. Here the runner runs the
+# same file `.githooks/pre-push` does; the hook stays because feedback before a
+# push beats feedback after one, not because CI is untrusted.
+#
+# What a release means here: install.sh and scripts-upgrade resolve the newest
+# `v*` tag on the remote and check the tree out at it. The TAG is the artifact.
+# There is deliberately no tarball, because nothing would ever download one.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # scripts-check skips shellcheck with a note when it is absent, so
+      # without this step the lint third of the gate would quietly not run.
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: scripts-check
+        run: bin/scripts-check
+
+  release:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists"; exit 0
+          fi
+          gh release create "$tag" \
+            --title "$tag" \
+            --generate-notes

@@ -4,26 +4,33 @@
 #   sh install.sh                 # latest release tag
 #   sh install.sh --edge          # track main instead
 #   sh install.sh --ref v0.2.0    # a specific tag or branch
+#   sh install.sh --ssh           # clone over SSH, for a checkout you push from
 #   sh install.sh --dry-run       # say what would happen, change nothing
 #
-# The repo is private, so there is no anonymous curl one-liner: this clones
-# over SSH and relies on the key that is already on the box. On a fresh
-# machine that means provisioning a key first — bin/provision-ssh-keys is the
-# tool for that, which is a chicken-and-egg only the very first time.
+# The repo is public, so a fresh box needs no key and no account:
 #
-#   ssh -T git@github.com          # must not say "Permission denied"
-#   git clone git@github.com:profullstack/scripts.git ~/scripts
-#   sh ~/scripts/install.sh
+#   curl -fsSL https://raw.githubusercontent.com/profullstack/scripts/main/install.sh | sh
+#
+# That is the whole install. Cloning over HTTPS also ends the chicken-and-egg
+# this file used to carry: provision-ssh-keys lives in this repo, so getting it
+# onto a new machine used to need the very key it exists to install.
+#
+# Use --ssh (or SCRIPTS_REPO) for a checkout you intend to push from. An HTTPS
+# clone reads fine and upgrades fine; it is just not set up to write.
 #
 # POSIX sh on purpose. This is the one file that runs before anything is
 # installed, possibly on a box whose only shell is dash, so it may not assume
 # bash the way the tools in bin/ do.
 #
-# There is no CI. The gate that used to be a GitHub Actions workflow is now
-# bin/scripts-check, run by .githooks/pre-push, because an unpaid balance on the
-# org suspends Actions compute on private repos and the job was refused before
-# it started. Not this repo's minutes, which are free -- storage and Code
-# Quality credits elsewhere. This script wires the hook up.
+# THE GATE RUNS TWICE, ON PURPOSE. bin/scripts-check is the rule. This script
+# points core.hooksPath at .githooks so it runs before every push, and
+# .github/workflows/release.yml runs that same file on the runner.
+#
+# CI is back because the repo is public. An unpaid balance on the org suspends
+# Actions compute on PRIVATE repos -- not this repo's minutes, which are free;
+# storage and Code Quality credits elsewhere -- and while this repo was private
+# the job was refused before it ever started. The balance is still owed; public
+# repos are simply not subject to it.
 #
 # WHY A TAG BY DEFAULT. Because `~/.local/bin/*` are symlinks into the working
 # tree, the command on PATH is whatever the checkout happens to be at. Tracking
@@ -34,7 +41,12 @@
 
 set -eu
 
+# HTTPS by default: the repo is public, so this works with no key, no account
+# and no prior setup, which is the whole point of the curl one-liner above.
+# SSH stays a flag away for the boxes that push.
+REPO_HTTPS="https://github.com/profullstack/scripts.git"
 REPO_SSH="git@github.com:profullstack/scripts.git"
+REPO="${SCRIPTS_REPO:-$REPO_HTTPS}"
 DIR="${SCRIPTS_DIR:-$HOME/scripts}"
 BINDIR="${SCRIPTS_BIN:-$HOME/.local/bin}"
 REF="${SCRIPTS_REF:-}"
@@ -43,12 +55,14 @@ DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --edge)     REF=main ;;
+    --ssh)      REPO="$REPO_SSH" ;;
+    --https)    REPO="$REPO_HTTPS" ;;
     --ref)      REF="${2:?--ref needs a tag or branch}"; shift ;;
     --ref=*)    REF="${1#--ref=}" ;;
     --dir)      DIR="${2:?--dir needs a path}"; shift ;;
     --bin)      BINDIR="${2:?--bin needs a path}"; shift ;;
     --dry-run|-n) DRY=1 ;;
-    -h|--help)  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)          echo "install.sh: unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -61,7 +75,7 @@ die()  { echo "install.sh: $*" >&2; exit 1; }
 # The newest v-tag on the remote, by version sort. Read from the remote rather
 # than a local tag list so a stale checkout cannot report an old "latest".
 latest_tag() {
-  git ls-remote --tags --refs "$REPO_SSH" 'v*' 2>/dev/null \
+  git ls-remote --tags --refs "$REPO" 'v*' 2>/dev/null \
     | awk '{print $2}' | sed 's#refs/tags/##' \
     | sort -V | tail -1
 }
@@ -71,8 +85,8 @@ latest_tag() {
 if [ ! -d "$DIR/.git" ]; then
   [ -e "$DIR" ] && die "$DIR exists but is not a git checkout; move it aside"
   if [ -z "$REF" ]; then REF="$(latest_tag)"; [ -n "$REF" ] || REF=main; fi
-  say "cloning $REPO_SSH -> $DIR at $REF"
-  run git clone --quiet "$REPO_SSH" "$DIR"
+  say "cloning $REPO -> $DIR at $REF"
+  run git clone --quiet "$REPO" "$DIR"
   [ "$DRY" = 1 ] || git -C "$DIR" -c advice.detachedHead=false checkout --quiet "$REF"
 else
   say "checkout exists at $DIR"

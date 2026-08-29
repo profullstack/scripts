@@ -5,13 +5,21 @@ Hand-written command-line tools. Everything in `bin/` is meant to sit on `PATH`.
 ## Install
 
 ```sh
-git clone git@github.com:profullstack/scripts.git ~/scripts
-sh ~/scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/profullstack/scripts/main/install.sh | sh
 ```
 
-The repo is private, so there is no anonymous `curl | sh`: the clone needs a key
-GitHub already knows. On a brand-new box that has to come first, which is the one
-chicken-and-egg here, since `provision-ssh-keys` is itself in this repo.
+That is the whole thing on a brand-new box: the repo is public, so the clone
+needs no key and no account. It also ends the chicken-and-egg this repo used to
+have, where `provision-ssh-keys` — the tool that puts our keys on a machine —
+could only be fetched using the key it exists to install.
+
+Cloning by hand works the same way, and `--ssh` gets you a checkout you can push
+from:
+
+```sh
+git clone https://github.com/profullstack/scripts.git ~/scripts
+sh ~/scripts/install.sh          # or: sh ~/scripts/install.sh --ssh
+```
 
 `install.sh` clones (or updates) the checkout, moves it to the newest release
 tag, and symlinks every executable in `bin/` into `~/.local/bin`. Symlinking
@@ -21,6 +29,7 @@ rather than copying keeps `~/.local/bin` and this repo from drifting apart.
 sh install.sh                 # newest release
 sh install.sh --edge          # track main instead
 sh install.sh --ref v0.2.0    # a specific tag
+sh install.sh --ssh           # clone over SSH, for a checkout you push from
 sh install.sh --dry-run       # say what would happen, change nothing
 ```
 
@@ -43,31 +52,35 @@ and checks the tree out at it. Cutting a release is therefore exactly:
 git tag -a v0.2.0 -m "..." && git push origin v0.2.0
 ```
 
-The gate runs before the push, not after it. `.githooks/pre-push` runs
-`scripts-check`, which parses every script by shebang, verifies the executable
-bits, and runs `shellcheck -S error` over the shell ones. Then publish the
-release object:
+Pushing the tag is enough. `.github/workflows/release.yml` runs the gate and
+then creates the release object, so `gh release create` by hand is only a
+fallback for when Actions is unavailable.
 
-```sh
-gh release create v0.2.0 --title "v0.2.0 — ..." --notes-file notes.md
-```
+**The gate runs twice, and that is deliberate.** `bin/scripts-check` is the
+rule — it parses every script by shebang, verifies the executable bits, and runs
+`shellcheck -S error` over the shell ones. `.githooks/pre-push` runs it before
+anything leaves the machine, and CI runs *that same file* on the runner. Neither
+is a re-implementation of the other, which is how the two used to be free to
+drift; the hook stays because feedback before a push beats feedback after one.
 
-**There is no CI, on purpose.** This was a GitHub Actions workflow until
-2026-08-29, when the job was refused before it ever ran: an unpaid balance on
-the `profullstack` org suspends Actions compute on private repos. It failed as a
-red X with no logs, which reads exactly like a broken workflow and is not one,
-and a gate that does not run is worse than no gate, because the X implies
-something was checked.
+**A note on the red X in the history, and why CI came back.** This workflow was
+deleted on 2026-08-29 and restored when the repo was opened up. It was never
+broken YAML: an unpaid balance on the `profullstack` org suspends Actions
+compute, and the job was refused before a runner was ever allocated — a red X
+with no logs, which is indistinguishable from a workflow that ran and failed. A
+gate that cannot run is worse than no gate, because the X implies something was
+checked, so it was removed rather than left there lying.
 
-Worth being precise about the money, because it is easy to assume wrongly: **this
+Be precise about the money, because the obvious assumption is wrong: **this
 repo's CI minutes were never the cost.** They are covered by the included
 allowance at net $0.00. The balance is Actions artifact storage and Code Quality
-credits accrued on unrelated repositories. Deleting this workflow therefore saved
-nothing on the bill, and clearing that balance would let Actions run again
-everywhere.
+credits accrued on unrelated repositories, so deleting this workflow saved
+nothing on the bill and was never going to.
 
-It stays deleted regardless, because nothing here needs a hosted runner: no
-build, no matrix, no secret, just three loops over files already on disk.
+What changed is not the balance — it is still owed, and every *private* repo in
+the org is still suspended by it. The suspension only applies to private repos.
+This one is public now, so the single thing standing between this workflow and a
+runner is gone.
 
 **A development checkout is left alone.** Because `~/.local/bin/*` are symlinks
 into the working tree, the command on PATH is whatever the checkout is at, so
@@ -243,7 +256,8 @@ scripts-check --quiet   # only complain
 ```
 
 `.githooks/pre-push` runs it before every push, wired up by `install.sh` via
-`git config core.hooksPath .githooks`. `git push --no-verify` bypasses it.
+`git config core.hooksPath .githooks`. `git push --no-verify` bypasses it — and
+CI then runs the same command on the runner, which does not.
 
 A missing `shellcheck` is skipped with a note rather than failing — an absent
 linter must not be able to block a release.
