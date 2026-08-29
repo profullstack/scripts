@@ -26,13 +26,21 @@ root="$(cd "$(dirname "$self")/.." && pwd)"
 if [[ "${1:-}" == "--status" ]]; then
   at="$(git -C "$root" describe --tags --always 2>/dev/null || echo unknown)"
   branch="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
-  latest="$(git ls-remote --tags --refs origin 'v*' 2>/dev/null \
-    | awk '{print $2}' | sed 's#refs/tags/##' | sort -V | tail -1)"
+  # -C "$root" is load-bearing: without it this reads whatever repo the caller
+  # happens to be standing in, and outside a repo it exits 128 and takes the
+  # whole command down before a single line is printed.
+  latest="$(git -C "$root" ls-remote --tags --refs origin 'v*' 2>/dev/null \
+    | awk '{print $2}' | sed 's#refs/tags/##' | sort -V | tail -1 || true)"
+  dirty="$(git -C "$root" status --porcelain 2>/dev/null | wc -l || echo 0)"
   printf '%-10s %s\n' checkout "$root"
   printf '%-10s %s (%s)\n' at "$at" "$branch"
-  printf '%-10s %s\n' newest "${latest:-none published}"
-  dirty="$(git -C "$root" status --porcelain | wc -l)"
-  [[ "$dirty" -gt 0 ]] && printf '%-10s %s uncommitted file(s)\n' local "$dirty"
+  printf '%-10s %s\n' newest "${latest:-unreachable}"
+  if [[ "$dirty" -gt 0 ]]; then
+    printf '%-10s %s uncommitted file(s)\n' local "$dirty"
+  fi
+  if [[ -n "$latest" && "$at" != "$latest" ]]; then
+    printf '\n%s\n' "an upgrade is available: $at -> $latest"
+  fi
   exit 0
 fi
 
