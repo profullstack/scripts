@@ -53,13 +53,21 @@ gh release create v0.2.0 --title "v0.2.0 — ..." --notes-file notes.md
 ```
 
 **There is no CI, on purpose.** This was a GitHub Actions workflow until
-2026-08-29, when the job was refused for billing before it ever ran —
-`profullstack` is on the free plan and this repo is private, so every workflow
-minute was chargeable. It failed as a red X with no logs, which reads exactly
-like a broken workflow and is not one; a gate that does not run is worse than no
-gate, because the X implies something was checked. Nothing here needs a hosted
-runner anyway: no build, no matrix, no secret, just three loops over files that
-are already on disk.
+2026-08-29, when the job was refused before it ever ran: an unpaid balance on
+the `profullstack` org suspends Actions compute on private repos. It failed as a
+red X with no logs, which reads exactly like a broken workflow and is not one,
+and a gate that does not run is worse than no gate, because the X implies
+something was checked.
+
+Worth being precise about the money, because it is easy to assume wrongly: **this
+repo's CI minutes were never the cost.** They are covered by the included
+allowance at net $0.00. The balance is Actions artifact storage and Code Quality
+credits accrued on unrelated repositories. Deleting this workflow therefore saved
+nothing on the bill, and clearing that balance would let Actions run again
+everywhere.
+
+It stays deleted regardless, because nothing here needs a hosted runner: no
+build, no matrix, no secret, just three loops over files already on disk.
 
 **A development checkout is left alone.** Because `~/.local/bin/*` are symlinks
 into the working tree, the command on PATH is whatever the checkout is at, so

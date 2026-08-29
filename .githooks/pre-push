@@ -2,10 +2,16 @@
 # Run the release gate before anything leaves this machine.
 #
 # This is where the gate lives now. It was a GitHub Actions workflow until
-# 2026-08-29, when the job was refused for billing before it ever started:
-# profullstack is on the free plan and this repo is private, so every minute
-# was chargeable. Nothing here needs a hosted runner — no build, no matrix, no
-# secret — so paying for one to run `bash -n` was the wrong shape.
+# 2026-08-29, when the job was refused before it ever started: an unpaid balance
+# on the profullstack org suspends Actions compute on private repos.
+#
+# Note the balance is NOT this repo's CI minutes -- those are covered by the
+# included allowance at net $0.00. It is Actions artifact storage and Code
+# Quality credits run up on unrelated repos. So deleting the workflow saved no
+# money; it was removed because a gate that cannot run is worse than no gate.
+#
+# Nothing here needs a hosted runner anyway -- no build, no matrix, no secret --
+# so a runner to execute `bash -n` was the wrong shape regardless.
 #
 # Set up by install.sh (`git config core.hooksPath .githooks`). To run the same
 # checks by hand: `scripts-check`. To push past it in an emergency:

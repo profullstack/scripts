@@ -4,12 +4,16 @@
 #   scripts-check          # check the checkout this command lives in
 #   scripts-check --quiet  # only complain
 #
-# This used to be a GitHub Actions workflow. It is not any more: the repo is
-# private and profullstack is on the free plan, so every minute of it was
-# billed, and in the end the job was refused for billing before it ever ran —
-# a red X with no logs, which reads exactly like a broken workflow and is not
-# one. A gate that does not run is worse than no gate, because the red X
-# implies something was checked.
+# This used to be a GitHub Actions workflow. It is not any more: an unpaid
+# balance on the profullstack org suspends Actions compute on private repos, so
+# the job was refused before it ever ran -- a red X with no logs, which reads
+# exactly like a broken workflow and is not one. A gate that does not run is
+# worse than no gate, because the red X implies something was checked.
+#
+# To be accurate about the money: this repo's CI minutes were never the cost.
+# They are covered by the included allowance at net $0.00. The balance is
+# Actions artifact storage and Code Quality credits on unrelated repos. Moving
+# the gate here saved nothing on the bill and was not meant to.
 #
 # So it runs here instead, and `.githooks/pre-push` runs it before every push.
 # Nothing about it needed a hosted runner: there is no build, no matrix, and

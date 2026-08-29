@@ -20,9 +20,10 @@
 # bash the way the tools in bin/ do.
 #
 # There is no CI. The gate that used to be a GitHub Actions workflow is now
-# bin/scripts-check, run by .githooks/pre-push, because this repo is private
-# under a free-plan org and every workflow minute was billed -- and in the end
-# refused for billing before the job started. This script wires the hook up.
+# bin/scripts-check, run by .githooks/pre-push, because an unpaid balance on the
+# org suspends Actions compute on private repos and the job was refused before
+# it started. Not this repo's minutes, which are free -- storage and Code
+# Quality credits elsewhere. This script wires the hook up.
 #
 # WHY A TAG BY DEFAULT. Because `~/.local/bin/*` are symlinks into the working
 # tree, the command on PATH is whatever the checkout happens to be at. Tracking
