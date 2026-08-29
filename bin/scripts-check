@@ -22,9 +22,14 @@
 #               next upgrade. This is the check that matters.
 #   executable  install.sh only symlinks files with the bit set, so a tool
 #               committed without it is silently absent rather than broken.
-#   shellcheck  hard errors only, and only on shell files. Skipped with a note
-#               if shellcheck is not installed rather than failing: a missing
-#               linter must not be able to block a release.
+#   lint        shellcheck, hard errors only, and only on shell files. Skipped
+#               with a note when it is not installed rather than failing: a
+#               missing linter must not be able to block a release.
+#
+# (That entry says "lint" rather than leading with the tool's name: a comment
+# whose first word is that name IS the syntax for a directive, so the line is
+# parsed as one and errors. This file failed its own lint step over exactly
+# that, which is at least evidence the step works.)
 
 set -uo pipefail
 
