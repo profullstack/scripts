@@ -4,17 +4,30 @@ set -euo pipefail
 orgs=''
 users=''
 limit=1000
+csv=0
+csv_path=''
 
 usage() {
   cat <<'EOF'
 Usage:
-  gh-issues --orgs ORG1,ORG2 [--users USER1,USER2] [--limit NUMBER]
-  gh-issues --users USER1,USER2 [--limit NUMBER]
+  gh-issues --orgs ORG1,ORG2 [--users USER1,USER2] [--limit NUMBER] [--csv[=FILE]]
+  gh-issues --users USER1,USER2 [--limit NUMBER] [--csv[=FILE]]
+
+Options:
+  --orgs ORGS     comma-separated organizations to search
+  --users USERS   comma-separated personal repository owners to search
+  --limit NUMBER  maximum results per scope (default 1000)
+  --csv           write a CSV to ~/gh-issues-YYYY-MM-DD.csv instead of printing
+                  the table; titles are not truncated and the timestamps are
+                  ISO 8601 rather than "3 days ago"
+  --csv=FILE      write that CSV to FILE instead
 
 Examples:
   gh-issues --orgs profullstack,moshcoder,h4kr,infernetprotocol
   gh-issues --users ralyodio,devpreshy
   gh-issues --orgs profullstack,moshcoder --users ralyodio,devpreshy
+  gh-issues --orgs profullstack --csv
+  gh-issues --orgs profullstack --csv=/tmp/issues.csv
 EOF
 }
 
@@ -58,6 +71,19 @@ while (($#)); do
       shift
       ;;
 
+    # Bare --csv deliberately takes no argument, so that `--csv --limit 10`
+    # cannot swallow the next flag as a filename. Use --csv=FILE for a path.
+    --csv)
+      csv=1
+      shift
+      ;;
+
+    --csv=*)
+      csv=1
+      csv_path=${1#*=}
+      shift
+      ;;
+
     -h|--help)
       usage
       exit 0
@@ -79,6 +105,20 @@ done
 
 ((limit <= 1000)) ||
   die '--limit cannot exceed 1000'
+
+if ((csv)); then
+  if [[ -z $csv_path ]]; then
+    csv_path="${HOME}/gh-issues-$(date +%Y-%m-%d).csv"
+  fi
+
+  csv_directory=$(dirname -- "$csv_path")
+
+  [[ -d $csv_directory ]] ||
+    die "no such directory: $csv_directory"
+
+  [[ -w $csv_directory ]] ||
+    die "directory is not writable: $csv_directory"
+fi
 
 org_list=()
 user_list=()
@@ -125,14 +165,10 @@ search_scope() {
     --json repository,number,title,url,author,createdAt,updatedAt
 }
 
-# Enable real terminal hyperlinks when stdout is a terminal.
-hyperlinks=0
+search_all_scopes() {
+  local org
+  local user
 
-if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
-  hyperlinks=1
-fi
-
-{
   # Organizations use org:
   for org in "${org_list[@]}"; do
     search_scope org "$org"
@@ -142,8 +178,18 @@ fi
   for user in "${user_list[@]}"; do
     search_scope user "$user"
   done
-} |
-jq -rs '
+}
+
+# Enable real terminal hyperlinks when stdout is a terminal.
+hyperlinks=0
+
+if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
+  hyperlinks=1
+fi
+
+# Shared jq helpers. Single-quoted so jq's own $variables survive: the shell
+# must not expand them.
+jq_common='
   def clean:
     tostring | gsub("[\t\r\n]+"; " ");
 
@@ -174,10 +220,15 @@ jq -rs '
         plural((($seconds / 31557600) | floor); "year")
       end;
 
-  (add // [])
-  | unique_by(.url)
-  | sort_by(.createdAt)
-  | reverse
+  def issues:
+    (add // [])
+    | unique_by(.url)
+    | sort_by(.createdAt)
+    | reverse;
+'
+
+jq_table="$jq_common"'
+  issues
   | (
       [
         "ORG/USER",
@@ -200,7 +251,51 @@ jq -rs '
       ])
     )
   | @tsv
-' |
+'
+
+# The CSV is the archival form: whole titles, real timestamps, and a bare issue
+# number so a spreadsheet reads it as one.
+jq_csv="$jq_common"'
+  issues
+  | (
+      [
+        "ORG/USER",
+        "REPOSITORY",
+        "ISSUE",
+        "AUTHOR",
+        "TITLE",
+        "CREATED",
+        "UPDATED",
+        "LINK"
+      ],
+
+      (.[] | [
+        (.repository.nameWithOwner | split("/")[0]),
+        .repository.nameWithOwner,
+        .number,
+        (.author.login // "-"),
+        (.title | clean),
+        .createdAt,
+        .updatedAt,
+        .url
+      ])
+    )
+  | @csv
+'
+
+if ((csv)); then
+  search_all_scopes | jq -rs "$jq_csv" > "$csv_path"
+
+  # Every field is newline-free by construction, so one line is one row.
+  written=$(wc -l < "$csv_path")
+
+  printf 'gh-issues: wrote %s issue(s) to %s\n' "$((written - 1))" "$csv_path"
+
+  exit 0
+fi
+
+search_all_scopes |
+jq -rs "$jq_table" |
 awk -F '\t' -v hyperlinks="$hyperlinks" '
   {
     rows = NR
