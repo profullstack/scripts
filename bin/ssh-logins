@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# ssh-logins — who actually got in over SSH, and from where.
+#
+#   ssh-logins                 # today (the default)
+#   ssh-logins yesterday       # any journalctl --since expression
+#   ssh-logins "3 days ago"
+#   ssh-logins -7d
+#   ssh-logins --count         # one row per user+source instead of every line
+#   ssh-logins --raw           # the journal lines, unformatted
+#
+# Reads the journal unprivileged: membership in the `adm` group is enough on
+# this box, so there is no sudo here and nothing to authenticate. Scoped to
+# `-u ssh` rather than the whole journal because the full day is ~15k lines and
+# grepping all of it to find thirty is most of the runtime.
+#
+# "Accepted" is the only thing counted. Failed and half-finished attempts are
+# the overwhelming bulk of what sshd logs on a public box (thousands a day of
+# "Connection closed by authenticating user root") and they answer a different
+# question; this one is about sessions that exist.
+
+set -euo pipefail
+
+since=today
+mode=lines
+
+for arg in "$@"; do
+  case "$arg" in
+    -c|--count) mode=count ;;
+    -r|--raw)   mode=raw ;;
+    -h|--help)  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)         since="$arg" ;;   # -7d, -1h and friends are --since expressions
+    *)          since="$arg" ;;
+  esac
+done
+
+accepted() {
+  journalctl -u ssh --since "$since" --no-pager 2>/dev/null \
+    | grep -E 'Accepted .* for .* from ' || true
+}
+
+# One journal scan, held in a variable: the empty check and the formatting both
+# want the same lines, and re-running it is the slow half of the script twice.
+hits="$(accepted)"
+
+# stderr, not stdout: an empty run is worth a word when a human typed it, and
+# still pipes as nothing when a script did.
+if [[ -z "$hits" ]]; then
+  echo "no accepted SSH logins since ${since}" >&2
+  exit 0
+fi
+
+case "$mode" in
+  raw)
+    printf '%s\n' "$hits"
+    ;;
+  count)
+    printf '%s\n' "$hits" \
+      | sed -E 's/.*Accepted ([^ ]+) for ([^ ]+) from ([^ ]+) .*/\2\t\3\t\1/' \
+      | sort | uniq -c | sort -rn \
+      | awk -F'\t' '{printf "%-28s %-18s %s\n", $1, $2, $3}'
+    ;;
+  lines)
+    printf '%s\n' "$hits" \
+      | sed -E 's/^([A-Z][a-z]{2} [ 0-9]{2} [0-9:]{8}) .*Accepted ([^ ]+) for ([^ ]+) from ([^ ]+) port [0-9]+ .*/\1\t\3\t\4\t\2/' \
+      | awk -F'\t' '{printf "%-15s %-10s %-18s %s\n", $1, $2, $3, $4}'
+    ;;
+esac
