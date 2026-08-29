@@ -19,6 +19,11 @@
 # installed, possibly on a box whose only shell is dash, so it may not assume
 # bash the way the tools in bin/ do.
 #
+# There is no CI. The gate that used to be a GitHub Actions workflow is now
+# bin/scripts-check, run by .githooks/pre-push, because this repo is private
+# under a free-plan org and every workflow minute was billed -- and in the end
+# refused for billing before the job started. This script wires the hook up.
+#
 # WHY A TAG BY DEFAULT. Because `~/.local/bin/*` are symlinks into the working
 # tree, the command on PATH is whatever the checkout happens to be at. Tracking
 # main means a half-finished edit made at a prompt is instantly the installed
@@ -95,6 +100,18 @@ else
       run git -C "$DIR" -c advice.detachedHead=false checkout --quiet "$REF"
     fi
   fi
+fi
+
+# ---------------------------------------------------------------- hooks
+
+# The release gate is a pre-push hook rather than CI. Hooks are not carried by
+# a clone, so every checkout has to be pointed at the tracked directory; it is
+# a local config setting, which is why it is done here and not once in the repo.
+if [ "$DRY" = 1 ]; then
+  echo "  would: git -C $DIR config core.hooksPath .githooks"
+elif [ -d "$DIR/.githooks" ]; then
+  git -C "$DIR" config core.hooksPath .githooks
+  say "  pre-push gate enabled (scripts-check)"
 fi
 
 # ---------------------------------------------------------------- link

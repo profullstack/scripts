@@ -43,9 +43,23 @@ and checks the tree out at it. Cutting a release is therefore exactly:
 git tag -a v0.2.0 -m "..." && git push origin v0.2.0
 ```
 
-`.github/workflows/release.yml` takes it from there — it parses every script,
-checks the executable bits, runs `shellcheck -S error` over the shell ones, and
-only then publishes the GitHub release.
+The gate runs before the push, not after it. `.githooks/pre-push` runs
+`scripts-check`, which parses every script by shebang, verifies the executable
+bits, and runs `shellcheck -S error` over the shell ones. Then publish the
+release object:
+
+```sh
+gh release create v0.2.0 --title "v0.2.0 — ..." --notes-file notes.md
+```
+
+**There is no CI, on purpose.** This was a GitHub Actions workflow until
+2026-08-29, when the job was refused for billing before it ever ran —
+`profullstack` is on the free plan and this repo is private, so every workflow
+minute was chargeable. It failed as a red X with no logs, which reads exactly
+like a broken workflow and is not one; a gate that does not run is worse than no
+gate, because the X implies something was checked. Nothing here needs a hosted
+runner anyway: no build, no matrix, no secret, just three loops over files that
+are already on disk.
 
 **A development checkout is left alone.** Because `~/.local/bin/*` are symlinks
 into the working tree, the command on PATH is whatever the checkout is at, so
@@ -208,6 +222,23 @@ a public box and answer a different question.
 ### `scripts-upgrade`
 
 Moves this box to the newest release of this repo. See [Upgrading](#upgrading).
+
+### `scripts-check`
+
+The release gate, runnable. Parses every script by shebang, checks that
+everything in `bin/` is executable, and runs `shellcheck -S error` over the
+shell ones.
+
+```sh
+scripts-check           # check the checkout this command lives in
+scripts-check --quiet   # only complain
+```
+
+`.githooks/pre-push` runs it before every push, wired up by `install.sh` via
+`git config core.hooksPath .githooks`. `git push --no-verify` bypasses it.
+
+A missing `shellcheck` is skipped with a note rather than failing — an absent
+linter must not be able to block a release.
 
 ## `wrappers/`
 

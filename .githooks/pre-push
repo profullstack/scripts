@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Run the release gate before anything leaves this machine.
+#
+# This is where the gate lives now. It was a GitHub Actions workflow until
+# 2026-08-29, when the job was refused for billing before it ever started:
+# profullstack is on the free plan and this repo is private, so every minute
+# was chargeable. Nothing here needs a hosted runner — no build, no matrix, no
+# secret — so paying for one to run `bash -n` was the wrong shape.
+#
+# Set up by install.sh (`git config core.hooksPath .githooks`). To run the same
+# checks by hand: `scripts-check`. To push past it in an emergency:
+# `git push --no-verify`.
+
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+if [ -x "$root/bin/scripts-check" ]; then
+  "$root/bin/scripts-check" || {
+    echo ""
+    echo "pre-push: refusing to push — scripts-check failed above."
+    echo "          fix it, or 'git push --no-verify' if you must."
+    exit 1
+  }
+fi

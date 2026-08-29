@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# scripts-check — the release gate, as something you can actually run.
+#
+#   scripts-check          # check the checkout this command lives in
+#   scripts-check --quiet  # only complain
+#
+# This used to be a GitHub Actions workflow. It is not any more: the repo is
+# private and profullstack is on the free plan, so every minute of it was
+# billed, and in the end the job was refused for billing before it ever ran —
+# a red X with no logs, which reads exactly like a broken workflow and is not
+# one. A gate that does not run is worse than no gate, because the red X
+# implies something was checked.
+#
+# So it runs here instead, and `.githooks/pre-push` runs it before every push.
+# Nothing about it needed a hosted runner: there is no build, no matrix, and
+# no secret. It is three loops over files that are already on disk.
+#
+# What it checks, and why each one:
+#
+#   parse       every script, by shebang. There is no build step here, so a
+#               syntax error goes straight to PATH on every box at once at the
+#               next upgrade. This is the check that matters.
+#   executable  install.sh only symlinks files with the bit set, so a tool
+#               committed without it is silently absent rather than broken.
+#   shellcheck  hard errors only, and only on shell files. Skipped with a note
+#               if shellcheck is not installed rather than failing: a missing
+#               linter must not be able to block a release.
+
+set -uo pipefail
+
+quiet=0
+[[ "${1:-}" == "--quiet" || "${1:-}" == "-q" ]] && quiet=1
+
+self="${BASH_SOURCE[0]}"
+if readlink -f "$self" >/dev/null 2>&1; then self="$(readlink -f "$self")"; fi
+root="$(cd "$(dirname "$self")/.." && pwd)"
+cd "$root"
+
+rc=0
+note() { [[ "$quiet" = 1 ]] || echo "$@"; }
+fail() { echo "FAIL: $*" >&2; rc=1; }
+
+# ---------------------------------------------------------------- parse
+
+note "parsing scripts in $root"
+for f in bin/* install.sh; do
+  [ -f "$f" ] || continue
+  case "$(head -1 "$f")" in
+    *bash*) bash -n "$f" 2>&1 | sed "s/^/  /" ; [ "${PIPESTATUS[0]}" = 0 ] || fail "$f does not parse" ;;
+    *node*) node --check "$f" >/dev/null 2>&1 || fail "$f does not parse" ;;
+    *sh*)   sh -n "$f"   2>&1 | sed "s/^/  /" ; [ "${PIPESTATUS[0]}" = 0 ] || fail "$f does not parse" ;;
+    *)      note "  no shebang, skipped: $f" ;;
+  esac
+done
+
+# ---------------------------------------------------------------- exec bit
+
+for f in bin/*; do
+  [ -f "$f" ] || continue
+  [ -x "$f" ] || fail "$f is not executable — install.sh will silently skip it"
+done
+
+# ---------------------------------------------------------------- shellcheck
+
+if command -v shellcheck >/dev/null 2>&1; then
+  note "shellcheck (errors only)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    shellcheck -S error "$f" || fail "shellcheck: $f"
+  done < <(for f in install.sh bin/*; do
+             [ -f "$f" ] || continue
+             # Shell files only, chosen by shebang. bin/ is mixed: domainjson is
+             # Node, and shellcheck reads perfectly good JS as a screenful of
+             # SC1127 "was this intended as a comment?".
+             case "$(head -1 "$f")" in *bash*|*/sh|*"env sh"*|*dash*) echo "$f" ;; esac
+           done)
+else
+  note "shellcheck not installed, skipped (apt-get install shellcheck)"
+fi
+
+# ---------------------------------------------------------------- verdict
+
+if [ "$rc" = 0 ]; then
+  note "ok"
+else
+  echo "scripts-check: $root did not pass" >&2
+fi
+exit $rc
