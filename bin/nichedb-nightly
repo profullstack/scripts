@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+#
+# Nightly Knowledge Influencer report for nichedb.dev, by email.
+#
+# nichedb's Postgres is on Railway's private network with no public proxy, so
+# this cannot be queried from here directly. The stats script is shipped into
+# the running container over `railway ssh` and executed there with `bun`, which
+# is the only runtime in that image (there is no psql). See the
+# railway-ssh-host-key-workaround note.
+#
+# Cron gets almost no environment, so PATH is set explicitly and every tool is
+# checked before use. A silent nightly job that stopped working months ago is
+# worse than no nightly job.
+#
+#   nichedb-nightly              send the report
+#   nichedb-nightly --dry-run    print it instead of sending
+#
+set -uo pipefail
+
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+
+PROJECT=fb518b20-ed8b-4066-a485-85c1b627063f
+SERVICE=fd8ab4c1-3787-461a-a9a6-3564603deee3
+ENVIRONMENT=production
+TO="${NICHEDB_REPORT_TO:-anthony@profullstack.com}"
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+fail() {
+  # A failure has to reach a human too, or the first thing anyone knows is that
+  # the reports quietly stopped.
+  echo "nichedb-nightly: $1" >&2
+  if [ "$DRY_RUN" = "0" ] && command -v mail >/dev/null 2>&1; then
+    printf 'The nightly nichedb report could not be produced.\n\n%s\n' "$1" |
+      mail send --to "$TO" --subject "NicheDB nightly FAILED" --file /dev/stdin >/dev/null 2>&1
+  fi
+  exit 1
+}
+
+command -v railway >/dev/null 2>&1 || fail "railway CLI is not on PATH"
+command -v mail >/dev/null 2>&1 || fail "the mail command is not on PATH"
+
+WORK=$(mktemp -d) || fail "could not make a temp dir"
+trap 'rm -rf "$WORK"' EXIT
+
+cat > "$WORK/stats.mjs" <<'STATS'
+import { SQL } from 'bun';
+const sql = new SQL({ url: process.env.DATABASE_URL });
+
+const money = (c) => `$${((Number(c) || 0) / 100).toFixed(2)}`;
+const one = async (q) => (await q)[0] ?? {};
+const out = [];
+const say = (s = '') => out.push(s);
+
+const now = new Date();
+say(`NICHEDB - KNOWLEDGE INFLUENCERS`);
+say(now.toISOString().replace('T', ' ').slice(0, 16) + ' UTC');
+say();
+
+// What is sitting on a human. This goes first because it is the only part
+// anyone can act on tonight.
+const todo = await one(sql`
+  select
+    (select count(*) from niche_claims where status = 'pending')::int as claims,
+    (select count(*) from contribution_events where status = 'pending')::int as contribs,
+    (select count(*) from agent_questions where status in ('open','researching'))::int as questions,
+    (select count(*) from payout_accounts where address is not null and verified_at is null)::int as addresses,
+    (select coalesce(sum(amount_minor),0) from revenue_allocations
+       where status in ('accrued','eligible'))::bigint as owed,
+    (select count(distinct influencer_id) from revenue_allocations
+       where status in ('accrued','eligible'))::int as owed_people`);
+const waiting =
+  todo.claims + todo.contribs + todo.questions + todo.addresses + (Number(todo.owed) > 0 ? 1 : 0);
+
+say('NEEDS A HUMAN');
+if (waiting === 0) say('  nothing waiting');
+else {
+  if (todo.claims) say(`  ${todo.claims} niche claim(s) awaiting a decision   /admin/knowledge`);
+  if (todo.contribs) say(`  ${todo.contribs} contribution(s) awaiting verification   /admin/knowledge`);
+  if (todo.questions) say(`  ${todo.questions} agent question(s) unanswered`);
+  if (todo.addresses) say(`  ${todo.addresses} payout address(es) awaiting confirmation   /admin/payouts`);
+  if (Number(todo.owed) > 0)
+    say(`  ${money(todo.owed)} owed across ${todo.owed_people} person/people   /admin/payouts`);
+}
+say();
+
+const n = await one(sql`
+  select count(*)::int as total,
+         count(*) filter (where status = 'operated')::int as operated,
+         count(*) filter (where status = 'open')::int as open
+  from niches`);
+const members = await one(sql`
+  select count(*)::int as active,
+         count(distinct user_id)::int as people
+  from niche_members where status = 'active'`);
+say('NICHES');
+say(`  ${n.total} total: ${n.operated} operated, ${n.open} open for a claim`);
+say(`  ${members.active} active membership(s) across ${members.people} person/people`);
+say();
+
+const c = await one(sql`
+  select count(*) filter (where status = 'verified')::int as verified,
+         count(*) filter (where status = 'pending')::int as pending,
+         count(*) filter (where status = 'verified' and created_at > now() - interval '24 hours')::int as verified_24h,
+         count(*) filter (where created_at > now() - interval '24 hours')::int as new_24h,
+         coalesce(sum(points) filter (where status = 'verified'),0)::int as points
+  from contribution_events`);
+say('CONTRIBUTIONS');
+say(`  last 24h: ${c.new_24h} recorded, ${c.verified_24h} verified`);
+say(`  all time: ${c.verified} verified, ${c.pending} pending, ${c.points} points awarded`);
+const topTypes = await sql`
+  select event_type, count(*)::int as n from contribution_events
+  where status = 'verified' group by event_type order by count(*) desc limit 4`;
+if (topTypes.length) say(`  most common: ${topTypes.map((t) => `${t.event_type} x${t.n}`).join(', ')}`);
+say();
+
+const q = await one(sql`
+  select count(*)::int as total,
+         count(*) filter (where status in ('open','researching'))::int as open,
+         count(*) filter (where status = 'answered')::int as answered,
+         count(*) filter (where created_at > now() - interval '24 hours')::int as asked_24h,
+         coalesce(extract(day from now() - min(created_at) filter (
+           where status in ('open','researching'))), 0)::int as oldest_days
+  from agent_questions`);
+const answers = await one(sql`
+  select count(*) filter (where kind = 'answered')::int as answered,
+         count(*) filter (where kind <> 'answered')::int as declined
+  from agent_answers`);
+say('AGENT QUESTIONS');
+say(`  ${q.asked_24h} asked in the last 24h; ${q.open} still open` +
+  (q.open && q.oldest_days ? ` (oldest ${q.oldest_days}d)` : ''));
+say(`  all time: ${q.total} asked, ${q.answered} settled, ${answers.declined} declined for context`);
+say();
+
+const rev = await one(sql`
+  select count(*)::int as events,
+         coalesce(sum(gross_amount_minor),0)::bigint as gross,
+         coalesce(sum(net_amount_minor),0)::bigint as net,
+         coalesce(sum(gross_amount_minor) filter (
+           where occurred_at > now() - interval '24 hours'),0)::bigint as gross_24h,
+         coalesce(sum(net_amount_minor) filter (where niche_id is not null),0)::bigint as attributed
+  from revenue_events`);
+const alloc = await one(sql`
+  select coalesce(sum(amount_minor) filter (
+           where status in ('accrued','eligible') and influencer_id is not null),0)::bigint as owed,
+         coalesce(sum(amount_minor) filter (
+           where status in ('scheduled','processing')),0)::bigint as scheduled,
+         coalesce(sum(amount_minor) filter (where status = 'paid'),0)::bigint as paid,
+         coalesce(sum(amount_minor) filter (where allocation_type = 'platform'),0)::bigint as platform
+  from revenue_allocations`);
+const sales = await one(sql`
+  select count(*)::int as n,
+         coalesce(sum(total_cents),0)::int as cents,
+         count(*) filter (where created_at > now() - interval '24 hours')::int as n_24h,
+         coalesce(sum(total_cents) filter (
+           where created_at > now() - interval '24 hours'),0)::int as cents_24h,
+         count(distinct lower(payer))::int as payers
+  from crawl_sales`);
+say('MONEY');
+say(`  crawl passes: ${sales.n_24h} sold in 24h (${money(sales.cents_24h)}), ` +
+  `${sales.n} all time (${money(sales.cents)}) from ${sales.payers} payer(s)`);
+say(`  ledger: ${rev.events} event(s), ${money(rev.gross)} gross, ${money(rev.net)} shareable`);
+say(`          ${money(rev.attributed)} attributed to a niche, ${money(alloc.platform)} to the platform`);
+say(`  owed ${money(alloc.owed)} · scheduled ${money(alloc.scheduled)} · paid ${money(alloc.paid)}`);
+say();
+
+const tiers = await sql`
+  select tier_slug, count(*)::int as n from contribution_scores group by tier_slug order by count(*) desc`;
+if (tiers.length) {
+  say('TIERS');
+  say(`  ${tiers.map((t) => `${t.tier_slug} x${t.n}`).join(', ')}`);
+  say();
+}
+
+const idx = await one(sql`
+  select (select count(*) from items)::int as items,
+         (select count(*) from items where first_seen_at > now() - interval '24 hours')::int as items_24h,
+         (select count(*) from collections)::int as collections`);
+say('INDEX (what a crawl pass buys, and what attribution divides by)');
+say(`  ${idx.items.toLocaleString('en-US')} items across ${idx.collections} collections, ` +
+  `${idx.items_24h.toLocaleString('en-US')} new in 24h`);
+say();
+
+// The honest headline. If no money has ever moved, say so rather than letting
+// a page of zeros imply something is broken.
+if (sales.n === 0 && rev.events === 0) {
+  say('No crawl pass has ever been bought and the ledger is empty, so every');
+  say('money line above is zero by circumstance rather than by fault. The');
+  say('paywall is live and answering 402.');
+} else if (Number(alloc.owed) === 0 && members.active === 0) {
+  say('Money is arriving but nobody operates a niche, so all of it is the');
+  say("platform's. A claimed niche is what starts splitting it.");
+}
+
+say();
+say('https://nichedb.dev/opportunities · /admin/knowledge · /admin/payouts');
+
+console.log(out.join('\n'));
+await sql.end();
+STATS
+
+B64=$(base64 -w0 "$WORK/stats.mjs") || fail "could not encode the stats script"
+
+# Quoting a Bun template literal through ssh mangles every ${...}, so the
+# script travels base64-encoded and is decoded on the far side.
+railway ssh -p "$PROJECT" -s "$SERVICE" -e "$ENVIRONMENT" \
+  "echo $B64 | base64 -d > /tmp/nightly.mjs && bun /tmp/nightly.mjs; rm -f /tmp/nightly.mjs" \
+  > "$WORK/raw.txt" 2>"$WORK/err.txt"
+
+# Railway prints its own chatter (deprecation notices, the SSH key it used) on
+# both streams; keep only the report, which starts at its own title line.
+sed -n '/^NICHEDB - KNOWLEDGE INFLUENCERS/,$p' "$WORK/raw.txt" > "$WORK/report.txt"
+
+if [ ! -s "$WORK/report.txt" ]; then
+  fail "no report came back from the container: $(tail -c 400 "$WORK/err.txt" 2>/dev/null)"
+fi
+
+SUBJECT="NicheDB nightly - $(date -u +%Y-%m-%d)"
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "--- would send to $TO as: $SUBJECT ---"
+  cat "$WORK/report.txt"
+  exit 0
+fi
+
+mail send --to "$TO" --subject "$SUBJECT" --file "$WORK/report.txt" >/dev/null 2>&1 ||
+  fail "the report was produced but mail send failed"
+
+echo "nichedb-nightly: sent to $TO"
