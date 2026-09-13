@@ -128,6 +128,44 @@ gh-issues --orgs profullstack --csv=/tmp/issues.csv
 Bare `--csv` takes no argument on purpose, so `--csv --limit 10` cannot swallow
 the next flag as a filename.
 
+### `gh-pulse`
+
+The daily "what moved on GitHub" email, with charts. Every repo the `gh` token
+can see (yours plus every org you belong to, forks excluded) is checked for
+movement since the previous run: stars, forks, commits, pull requests, issues,
+releases, and the traffic GitHub shows at `/graphs/traffic` (views, unique
+visitors, clones, referrers, popular content). Repos with movement are ranked
+by a weighted score; each one comes with its traffic, the top ones with a
+14-day chart, and new or lost followers are named.
+
+```sh
+gh-pulse                       # scan, email, snapshot
+gh-pulse --dry-run             # scan and write the HTML, send nothing
+gh-pulse --top 12              # how many ranked repos get a chart and detail
+gh-pulse --repo profullstack/nixamp   # only this repo (repeatable)
+```
+
+Movement is measured against the previous snapshot rather than a clock,
+because GitHub publishes traffic in UTC-day buckets one to two days late:
+each run counts the growth of the 14-day buckets since the last run, so a
+skipped day is neither lost nor double counted (the header says how long the
+window was). Every run writes `~/.local/share/gh-pulse/snapshots/<date>.json.gz`
+with the raw per-repo counts and traffic buckets; GitHub keeps nothing past 14
+days, so those files are the long-run history. `out/latest.html`, `.txt` and
+`.json` next to them are the last report.
+
+Mail goes through Resend: `RESEND_API_KEY` from the environment, or from
+`~/.config/logicsrc/shell.env` when unset (the cron case). The from address
+must sit on a verified Resend domain; `GH_PULSE_FROM` overrides it and
+`GH_PULSE_TO` (or `--to`) the recipient. The chart rasteriser is a small npm
+dependency in `lib/gh-pulse/`, installed on first run.
+
+A daily cron entry looks like:
+
+```
+5 13 * * * /home/anthony/scripts/bin/gh-pulse >>/home/anthony/.local/share/gh-pulse/cron.log 2>&1
+```
+
 ### `gh-prs-merge`
 
 Walks the same scopes and squash-merges every PR that qualifies, oldest first.
@@ -315,6 +353,7 @@ an installer is unavailable and you need the old contents back.
 
 `gh` (authenticated), `jq`, and `awk`. `provision-ssh-keys` needs only OpenSSH
 (`ssh`, `ssh-keyscan`, `ssh-keygen`) locally and `bash` on the remote host.
+`gh-pulse` wants `node` 20+ and `npm` (once, for its chart dependency).
 `domainjson` additionally wants `node`,
 `dig`, and the OpenRDAP CLI (`go install github.com/openrdap/rdap/cmd/rdap@latest`,
 run from `~/go/bin/rdap` or on `PATH`). `ssh-logins` needs `journalctl` and
