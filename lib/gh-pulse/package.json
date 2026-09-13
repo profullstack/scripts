@@ -1,0 +1,8 @@
+{
+  "name": "gh-pulse-deps",
+  "private": true,
+  "description": "Runtime dependencies for bin/gh-pulse. Installed on first run; never published.",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2"
+  }
+}
