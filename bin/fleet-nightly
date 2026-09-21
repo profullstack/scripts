@@ -1,0 +1,498 @@
+#!/usr/bin/env node
+// fleet-nightly — one email a night: yesterday against the day before, for
+// every property in the fleet.
+//
+//   fleet-nightly                 send the report for yesterday (UTC)
+//   fleet-nightly --dry-run       build it, write it under the data dir, send nothing
+//   fleet-nightly --day 2026-09-20  report a specific UTC day
+//   fleet-nightly --to a@b.com    someone else
+//
+// Two sources, both read through one Supabase management token:
+//   traffic  the CrawlProof tracker's daily rollups (tracker_event_daily_stats
+//            on the crawlproof.com project), human hits only, per UTC day
+//   accounts auth.users on every Supabase-backed property: signups by created_at,
+//            logins by last_sign_in_at (a per-user "last" stamp, so a user who
+//            came back today no longer counts for yesterday; the yesterday
+//            number is exact at send time, the day-before one is a floor)
+//
+// Secrets come from the team vault `fleet-nightly--prod` (logicsrc teams pull)
+// unless already in the environment: SUPABASE_ACCESS_TOKEN, RESEND_API_KEY,
+// CRAWLPROOF_TOKEN. Cron gets almost no environment, so PATH is fixed below
+// and every failure is mailed too: a nightly job that dies silently is worse
+// than none.
+
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+].join(':');
+
+// The fleet, in the order Anthony listed it. Sorting is by traffic in the
+// report; this order only decides ties.
+export const PROPERTIES = `b1dz.com bl0ggers.com brisk.news c0mpute.com c0ncerts.com c0upons.com
+coinpayportal.com crawlproof.com d0rz.com logicsrc.com marksyncr.com bittorrented.com naallo.com
+pairux.com phonenumbers.bot postammo.com profullstack.com qaaas.dev qrypt.chat recipepdfs.com
+saasrow.com sh1pt.com smshub.dev threatcrush.com ugig.net vu1nz.com weedforcrypto.com
+tronbrowser.dev goingbroke.now infernetprotocol.com moshcode.sh moshcoding.com aiornot.vote
+advis0r.com spl00f.com bbs.profullstack.com outreachgraph.com reeleel.com rssamplifier.com
+bufferoverride.com tipoffwatch.com genrewatch.com p0dcasters.com d3vices.com diskpush.com
+hqtui.com chovy.com nichedb.dev readm3.com watchnews.now nixamp.com agenticjobs.work
+nightcell7.com r4ck.dev`.split(/\s+/).filter(Boolean);
+
+const CRAWLPROOF_PROJECT = 'ywcizjsgrcmhgyplldac'; // crawlproof.com's Supabase project, where the tracker lives
+const CLICK_EVENTS = ['button_click', 'internal_click', 'outbound_click', 'download_click'];
+const AUTH_PATH = '(login|signin|sign-in|signup|sign-up|register|auth|magic|passkey|account)';
+const DATA_DIR = process.env.FLEET_NIGHTLY_DATA || join(homedir(), '.local/share/fleet-nightly');
+const DEFAULT_FROM = 'Fleet nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'anthony@profullstack.com';
+const STRIP_DAYS = 7;
+
+// ---------------------------------------------------------------- args
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = opt('--to') || process.env.FLEET_REPORT_TO || DEFAULT_TO;
+const FROM = process.env.FLEET_REPORT_FROM || DEFAULT_FROM;
+
+// ---------------------------------------------------------------- dates
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, n) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const FIRST = addDays(DAY, -(STRIP_DAYS - 1));
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(FIRST, i));
+
+// ---------------------------------------------------------------- secrets
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+function loadSecrets() {
+  const s = {
+    SUPABASE_ACCESS_TOKEN: process.env.SUPABASE_ACCESS_TOKEN,
+    RESEND_API_KEY: process.env.RESEND_API_KEY,
+    CRAWLPROOF_TOKEN: process.env.CRAWLPROOF_TOKEN,
+  };
+  const missing = () => Object.keys(s).filter((k) => !s[k]);
+  if (missing().length) {
+    // The vault is the source of truth; a temp file only because the CLI
+    // writes a file. It lives for the length of one call.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-nightly-'));
+    try {
+      execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], {
+        stdio: ['ignore', 'ignore', 'ignore'], timeout: 60_000,
+      });
+      const pulled = parseEnv(readFileSync(join(dir, 'env'), 'utf8'));
+      for (const k of missing()) if (pulled[k]) s[k] = pulled[k];
+    } catch (e) {
+      // fall through to the local fallbacks; the report says what it lacks
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  if (!s.CRAWLPROOF_TOKEN) {
+    const f = join(homedir(), '.crawlproof.json');
+    if (existsSync(f)) try { s.CRAWLPROOF_TOKEN = JSON.parse(readFileSync(f, 'utf8')).token; } catch {}
+  }
+  if (!s.RESEND_API_KEY) {
+    const f = join(homedir(), '.config/logicsrc/shell.env');
+    if (existsSync(f)) s.RESEND_API_KEY = parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY;
+  }
+  return s;
+}
+
+// ---------------------------------------------------------------- sources
+
+async function getJson(url, headers) {
+  const r = await fetch(url, { headers });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`${url} -> ${r.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+/** Run read-only SQL on a Supabase project through the management API. */
+async function sql(token, ref, query) {
+  const r = await fetch(`https://api.supabase.com/v1/projects/${ref}/database/query`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, read_only: true }),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`sql on ${ref} -> ${r.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+const hostOf = (url) => { try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch { return null; } };
+
+/** The tracker's projects, so each property maps to a project id. */
+async function trackerSites(crawlproofToken) {
+  const { sites } = await getJson('https://crawlproof.com/api/tracker/v1/sites', { Authorization: `Bearer ${crawlproofToken}` });
+  const byHost = new Map();
+  for (const s of sites) {
+    const host = hostOf(s.url) || s.name.toLowerCase();
+    if (PROPERTIES.includes(host)) byHost.set(host, s);
+  }
+  return byHost;
+}
+
+/** Per project, per day, per kind: pageviews, hits, clicks, forms, auth-form submits. */
+async function trackerRows(token, ids) {
+  if (!ids.length) return [];
+  const list = ids.map((id) => `'${id}'`).join(',');
+  const clicks = CLICK_EVENTS.map((e) => `'${e}'`).join(',');
+  return sql(token, CRAWLPROOF_PROJECT, `
+    select project_id, day::text as day, coalesce(kind, 'human') as kind,
+      coalesce(sum(count) filter (where event = 'pageview'), 0)::int as pv,
+      coalesce(sum(count), 0)::int as hits,
+      coalesce(sum(count) filter (where event in (${clicks})), 0)::int as clicks,
+      coalesce(sum(count) filter (where event = 'form_submit'), 0)::int as forms,
+      coalesce(sum(count) filter (where event = 'form_submit' and page_path ~* '${AUTH_PATH}'), 0)::int as auth_forms
+    from tracker_event_daily_stats
+    where project_id in (${list}) and day >= '${FIRST}' and day <= '${DAY}'
+    group by 1, 2, 3`);
+}
+
+/** Which Supabase projects are properties. Names are hosts, or a host minus .com. */
+async function authProjects(token) {
+  const projects = await getJson('https://api.supabase.com/v1/projects', { Authorization: `Bearer ${token}` });
+  const out = [];
+  for (const p of projects) {
+    const name = String(p.name || '').toLowerCase();
+    const host = PROPERTIES.includes(name) ? name : PROPERTIES.includes(`${name}.com`) ? `${name}.com` : null;
+    if (host && p.status !== 'INACTIVE') out.push({ host, ref: p.id, status: p.status });
+  }
+  return out;
+}
+
+async function authStats(token, ref) {
+  const [row] = await sql(token, ref, `
+    select
+      (select count(*) from auth.users)::int as total,
+      (select coalesce(json_object_agg(d, n), '{}'::json) from (
+        select (created_at at time zone 'UTC')::date::text as d, count(*)::int as n
+        from auth.users where created_at >= '${FIRST}' group by 1) s) as signups,
+      (select coalesce(json_object_agg(d, n), '{}'::json) from (
+        select (last_sign_in_at at time zone 'UTC')::date::text as d, count(*)::int as n
+        from auth.users where last_sign_in_at >= '${FIRST}' group by 1) s) as logins`);
+  return { total: row.total, signups: row.signups || {}, logins: row.logins || {} };
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+// ---------------------------------------------------------------- assemble
+
+const zeroDays = () => Object.fromEntries(DAYS.map((d) => [d, 0]));
+
+export function assemble({ sites, rows, auth }) {
+  const byId = new Map();
+  for (const [host, s] of sites) byId.set(s.id, host);
+  const props = new Map(PROPERTIES.map((host) => [host, {
+    host,
+    tracked: sites.has(host),
+    views: zeroDays(), hits: zeroDays(), bots: zeroDays(), clicks: zeroDays(), forms: zeroDays(), authForms: zeroDays(),
+    auth: null,
+  }]));
+  for (const r of rows) {
+    const host = byId.get(r.project_id);
+    const p = host && props.get(host);
+    if (!p || !(r.day in p.views)) continue;
+    if (r.kind === 'bot') { p.bots[r.day] += r.pv; continue; }
+    p.views[r.day] += r.pv; p.hits[r.day] += r.hits; p.clicks[r.day] += r.clicks; p.forms[r.day] += r.forms; p.authForms[r.day] += r.auth_forms;
+  }
+  for (const a of auth) {
+    const p = props.get(a.host);
+    if (!p) continue;
+    p.auth = a.error ? { error: a.error } : {
+      total: a.total,
+      signups: Object.fromEntries(DAYS.map((d) => [d, a.signups[d] || 0])),
+      logins: Object.fromEntries(DAYS.map((d) => [d, a.logins[d] || 0])),
+    };
+  }
+  return [...props.values()];
+}
+
+const n = (v) => Number(v || 0).toLocaleString('en-US');
+const signed = (v) => (v > 0 ? `+${n(v)}` : v < 0 ? `-${n(-v)}` : '±0');
+const pct = (cur, prev) => (cur === prev ? '' : prev === 0 ? 'new' : `${cur > prev ? '+' : '-'}${Math.round(Math.abs(cur - prev) / prev * 100)}%`);
+
+export function summarize(props) {
+  const sum = (pick) => {
+    const t = zeroDays();
+    for (const p of props) { const m = pick(p); if (m) for (const d of DAYS) t[d] += m[d] || 0; }
+    return t;
+  };
+  const views = sum((p) => p.views);
+  const clicks = sum((p) => p.clicks);
+  const forms = sum((p) => p.forms);
+  const signups = sum((p) => p.auth && !p.auth.error ? p.auth.signups : null);
+  const logins = sum((p) => p.auth && !p.auth.error ? p.auth.logins : null);
+  const bots = sum((p) => p.bots);
+  const users = props.reduce((t, p) => t + (p.auth && !p.auth.error ? p.auth.total : 0), 0);
+  const tracked = props.filter((p) => p.tracked);
+  const withAuth = props.filter((p) => p.auth && !p.auth.error);
+  const authErrors = props.filter((p) => p.auth && p.auth.error);
+  const untracked = props.filter((p) => !p.tracked);
+  const movers = tracked
+    .map((p) => ({ host: p.host, cur: p.views[DAY], prev: p.views[PREV], delta: p.views[DAY] - p.views[PREV] }))
+    .filter((m) => Math.abs(m.delta) >= 5 && Math.max(m.cur, m.prev) >= 20);
+  const up = movers.filter((m) => m.delta > 0).sort((a, b) => b.delta - a.delta).slice(0, 5);
+  const down = movers.filter((m) => m.delta < 0).sort((a, b) => a.delta - b.delta).slice(0, 5);
+  const ranked = [...props].sort((a, b) =>
+    (b.tracked - a.tracked) || (b.views[DAY] - a.views[DAY]) || (b.views[PREV] - a.views[PREV]) ||
+    ((b.auth?.logins?.[DAY] || 0) - (a.auth?.logins?.[DAY] || 0)) || (PROPERTIES.indexOf(a.host) - PROPERTIES.indexOf(b.host)));
+  const quiet = tracked.filter((p) => DAYS.every((d) => p.views[d] === 0)).map((p) => p.host);
+  return { views, clicks, forms, signups, logins, bots, users, tracked, withAuth, authErrors, untracked, up, down, ranked, quiet };
+}
+
+export function subjectLine(s) {
+  return `Fleet nightly, ${dayLabel(DAY)}: ${n(s.views[DAY])} views (${pct(s.views[DAY], s.views[PREV]) || '±0'}), ${n(s.signups[DAY])} signups, ${n(s.logins[DAY])} logins`;
+}
+
+// ---------------------------------------------------------------- html
+
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6';
+const RAMP = ['#eef3fb', '#c9dbf5', '#9dbfee', '#6ba0e4', '#2a78d6'];
+
+const deltaHtml = (cur, prev, big = false) => {
+  const d = cur - prev;
+  const color = d > 0 ? UP : d < 0 ? DOWN : MUTE;
+  const p = pct(cur, prev);
+  return `<span style="color:${color};font-size:${big ? 12 : 11}px;white-space:nowrap">${signed(d)}${p ? ` (${p})` : ''}</span>`;
+};
+
+/** Seven small cells, shaded by that property's own scale. */
+function strip(series, max) {
+  const cells = DAYS.map((d) => {
+    const v = series[d] || 0;
+    const shade = v === 0 ? '#f4f4f2' : RAMP[Math.min(4, Math.ceil((v / Math.max(1, max)) * 4))];
+    return `<td title="${d}: ${n(v)}" style="width:9px;height:14px;background:${shade};border-right:1px solid #fcfcfb;font-size:0;line-height:0">&nbsp;</td>`;
+  }).join('');
+  return `<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border-radius:3px;overflow:hidden"><tr>${cells}</tr></table>`;
+}
+
+const metricCell = (cur, prev, opts = {}) => {
+  if (cur === null) return `<td style="padding:7px 6px;text-align:right;color:#c9c8c2;border-bottom:1px solid ${LINE}">·</td>`;
+  const dim = cur === 0 && prev === 0;
+  return `<td style="padding:7px 6px;text-align:right;border-bottom:1px solid ${LINE};vertical-align:top;white-space:nowrap">` +
+    `<div style="font-weight:${opts.bold ? 600 : 500};color:${dim ? '#c9c8c2' : INK}">${n(cur)}</div>` +
+    (dim ? '' : `<div>${deltaHtml(cur, prev)}</div>`) + '</td>';
+};
+
+export function renderHtml(props, s, meta) {
+  const tile = (label, cur, prev, sub) =>
+    `<td style="padding:10px 12px;border:1px solid ${LINE};border-radius:8px;vertical-align:top;width:25%;background:#fff">` +
+    `<div style="font-size:11px;color:${MUTE};text-transform:uppercase;letter-spacing:.04em">${label}</div>` +
+    `<div style="font-size:24px;font-weight:600;color:${INK};line-height:1.2">${n(cur)}</div>` +
+    `<div>${deltaHtml(cur, prev, true)} <span style="font-size:11px;color:${MUTE}">vs ${esc(dayLabel(PREV).split(' ')[0])}</span></div>` +
+    (sub ? `<div style="font-size:11px;color:${MUTE};margin-top:2px">${sub}</div>` : '') + '</td>';
+
+  const maxFleet = Math.max(1, ...DAYS.map((d) => s.views[d]));
+  const fleetBars = DAYS.map((d) => {
+    const w = Math.max(1, Math.round((s.views[d] / maxFleet) * 100));
+    const isDay = d === DAY;
+    return `<tr><td style="padding:2px 10px 2px 0;font-size:12px;color:${isDay ? INK : MUTE};white-space:nowrap;font-weight:${isDay ? 600 : 400}">${esc(dayLabel(d))}</td>` +
+      `<td style="width:100%;padding:2px 0"><table role="presentation" cellpadding="0" cellspacing="0" style="width:100%"><tr>` +
+      `<td style="width:${w}%;background:${isDay ? BLUE : '#9dbfee'};height:10px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` +
+      `<td style="font-size:12px;color:${INK};padding-left:8px;white-space:nowrap">${n(s.views[d])}<span style="color:${MUTE}"> views · ${n(s.signups[d])} signups · ${n(s.logins[d])} logins</span></td><td></td></tr></table></td></tr>`;
+  }).join('');
+
+  const moverList = (list, color) => list.length
+    ? list.map((m) => `<div style="padding:2px 0;font-size:13px"><span style="color:${color};font-weight:600">${signed(m.delta)}</span> <a href="https://${esc(m.host)}/" style="color:${INK};text-decoration:none">${esc(m.host)}</a> <span style="color:${MUTE};font-size:12px">${n(m.prev)} → ${n(m.cur)}</span></div>`).join('')
+    : `<div style="font-size:12px;color:${MUTE}">nothing of size</div>`;
+
+  const header = (label, align = 'right') => `<th style="padding:6px 6px;text-align:${align};font-size:11px;color:${MUTE};font-weight:600;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid ${LINE};white-space:nowrap">${label}</th>`;
+
+  let rowsHtml = '';
+  for (const p of s.ranked) {
+    const a = p.auth && !p.auth.error ? p.auth : null;
+    const max = Math.max(...DAYS.map((d) => p.views[d]));
+    const name = `<a href="https://${esc(p.host)}/" style="color:${INK};text-decoration:none;font-weight:600">${esc(p.host)}</a>`;
+    const tags = [];
+    if (!p.tracked) tags.push('no tracker');
+    if (p.auth && p.auth.error) tags.push('accounts unreadable');
+    const tagHtml = tags.length ? `<div style="font-size:11px;color:${MUTE}">${esc(tags.join(' · '))}</div>` : '';
+    rowsHtml += `<tr>` +
+      `<td style="padding:7px 6px 7px 0;border-bottom:1px solid ${LINE};vertical-align:top">${name}${tagHtml}</td>` +
+      `<td style="padding:7px 6px;border-bottom:1px solid ${LINE};vertical-align:top">${p.tracked ? strip(p.views, max) : ''}</td>` +
+      metricCell(p.tracked ? p.views[DAY] : null, p.views[PREV], { bold: true }) +
+      metricCell(p.tracked ? p.clicks[DAY] : null, p.clicks[PREV]) +
+      metricCell(p.tracked ? p.forms[DAY] : null, p.forms[PREV]) +
+      metricCell(a ? a.signups[DAY] : null, a ? a.signups[PREV] : 0, { bold: true }) +
+      metricCell(a ? a.logins[DAY] : null, a ? a.logins[PREV] : 0) +
+      `<td style="padding:7px 0 7px 6px;text-align:right;border-bottom:1px solid ${LINE};vertical-align:top;color:${a ? MUTE : '#c9c8c2'}">${a ? n(a.total) : '·'}</td>` +
+      `</tr>`;
+  }
+
+  const untrackedNote = s.untracked.length
+    ? `<div style="margin-top:6px"><span style="font-weight:600">Not instrumented:</span> ${s.untracked.map((p) => esc(p.host)).join(', ')} have no CrawlProof tracker project, so their traffic is unknown${s.untracked.some((p) => p.auth && !p.auth.error) ? '; the ones with accounts still report signups and logins' : ''}.</div>`
+    : '';
+  const quietNote = s.quiet.length
+    ? `<div style="margin-top:6px"><span style="font-weight:600">Silent all week:</span> ${s.quiet.map(esc).join(', ')} are tracked but recorded no human views in 7 days. That is either no readers or a tracker that stopped firing.</div>`
+    : '';
+  const authErrNote = s.authErrors.length
+    ? `<div style="margin-top:6px"><span style="font-weight:600">Accounts unreadable:</span> ${s.authErrors.map((p) => `${esc(p.host)} (${esc(p.auth.error)})`).join('; ')}.</div>`
+    : '';
+
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">Fleet nightly · ${esc(dayLabel(DAY, true))}</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">${PROPERTIES.length} properties · ${s.tracked.length} with traffic tracking · ${s.withAuth.length} with accounts · UTC days, humans only · compared with ${esc(dayLabel(PREV))}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:14px -6px 0;border-collapse:separate"><tr>
+${tile('Views', s.views[DAY], s.views[PREV], `${n(s.bots[DAY])} bot views excluded`)}
+${tile('Clicks', s.clicks[DAY], s.clicks[PREV], `${n(s.forms[DAY])} form submits`)}
+${tile('Signups', s.signups[DAY], s.signups[PREV], `${n(s.users)} accounts in all`)}
+${tile('Logins', s.logins[DAY], s.logins[PREV], 'users whose last sign-in was that day')}
+</tr></table>
+
+<div style="font-size:15px;font-weight:700;margin:18px 0 6px">Last ${STRIP_DAYS} days across the fleet</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${fleetBars}</table>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:16px"><tr>
+<td style="vertical-align:top;width:50%;padding-right:12px"><div style="font-size:15px;font-weight:700;margin-bottom:4px">Up</div>${moverList(s.up, UP)}</td>
+<td style="vertical-align:top;width:50%;padding-left:12px"><div style="font-size:15px;font-weight:700;margin-bottom:4px">Down</div>${moverList(s.down, DOWN)}</td>
+</tr></table>
+
+<div style="font-size:15px;font-weight:700;margin:22px 0 6px">Every property</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+<tr>${header('Property', 'left')}${header('7d', 'left')}${header('Views')}${header('Clicks')}${header('Forms')}${header('Signups')}${header('Logins')}${header('Users')}</tr>
+${rowsHtml}
+</table>
+
+<div style="font-size:12px;color:${MUTE};margin-top:14px">${untrackedNote}${quietNote}${authErrNote}</div>
+
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">Views, clicks and form submits are the CrawlProof tracker's daily rollups for hits it did not classify as a crawler; bot views are shown only in the tile. Clicks = button, internal, outbound and download clicks. Signups and logins come from Supabase Auth on the properties that use it: signups by account creation date, logins by each user's last sign-in date, so the earlier day is a floor. Each 7-day strip is shaded on that property's own scale. Generated by fleet-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
+</td></tr></table></div>`;
+}
+
+export function renderText(props, s, meta) {
+  const out = [];
+  out.push(`FLEET NIGHTLY  ${dayLabel(DAY, true)}  (vs ${dayLabel(PREV)}, UTC days, humans only)`);
+  out.push(`${PROPERTIES.length} properties · ${s.tracked.length} tracked · ${s.withAuth.length} with accounts`);
+  out.push('');
+  const line = (label, cur, prev) => `${label.padEnd(9)} ${n(cur).padStart(8)}  ${signed(cur - prev)} ${pct(cur, prev)}`.trimEnd();
+  out.push(line('views', s.views[DAY], s.views[PREV]));
+  out.push(line('clicks', s.clicks[DAY], s.clicks[PREV]));
+  out.push(line('forms', s.forms[DAY], s.forms[PREV]));
+  out.push(line('signups', s.signups[DAY], s.signups[PREV]));
+  out.push(line('logins', s.logins[DAY], s.logins[PREV]));
+  out.push(`users     ${n(s.users).padStart(8)}`);
+  out.push('');
+  out.push(`Last ${STRIP_DAYS} days: ` + DAYS.map((d) => `${d.slice(5)} ${n(s.views[d])}`).join(' · '));
+  out.push('');
+  if (s.up.length) out.push('UP    ' + s.up.map((m) => `${m.host} ${signed(m.delta)} (${m.prev}→${m.cur})`).join(', '));
+  if (s.down.length) out.push('DOWN  ' + s.down.map((m) => `${m.host} ${signed(m.delta)} (${m.prev}→${m.cur})`).join(', '));
+  out.push('');
+  out.push(`${'property'.padEnd(24)}${'views'.padStart(8)}${'Δ'.padStart(7)}${'clicks'.padStart(8)}${'forms'.padStart(7)}${'signups'.padStart(9)}${'logins'.padStart(8)}${'users'.padStart(8)}`);
+  for (const p of s.ranked) {
+    const a = p.auth && !p.auth.error ? p.auth : null;
+    const t = p.tracked;
+    out.push(`${p.host.padEnd(24)}${(t ? n(p.views[DAY]) : '·').padStart(8)}${(t ? signed(p.views[DAY] - p.views[PREV]) : '').padStart(7)}${(t ? n(p.clicks[DAY]) : '·').padStart(8)}${(t ? n(p.forms[DAY]) : '·').padStart(7)}${(a ? n(a.signups[DAY]) : '·').padStart(9)}${(a ? n(a.logins[DAY]) : '·').padStart(8)}${(a ? n(a.total) : '·').padStart(8)}`);
+  }
+  out.push('');
+  if (s.untracked.length) out.push(`Not instrumented (no CrawlProof project): ${s.untracked.map((p) => p.host).join(', ')}`);
+  if (s.quiet.length) out.push(`Silent all week: ${s.quiet.join(', ')}`);
+  if (s.authErrors.length) out.push(`Accounts unreadable: ${s.authErrors.map((p) => `${p.host} (${p.auth.error})`).join('; ')}`);
+  out.push(`Generated by fleet-nightly on ${hostname()} at ${meta.generatedAt}`);
+  return out.join('\n');
+}
+
+// ---------------------------------------------------------------- send
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+// ---------------------------------------------------------------- main
+
+async function main() {
+  const t0 = Date.now();
+  const secrets = loadSecrets();
+  if (!secrets.SUPABASE_ACCESS_TOKEN) throw new Error('no SUPABASE_ACCESS_TOKEN (vault fleet-nightly--prod or the environment)');
+  if (!secrets.CRAWLPROOF_TOKEN) throw new Error('no CRAWLPROOF_TOKEN (vault, environment, or ~/.crawlproof.json)');
+
+  const sites = await trackerSites(secrets.CRAWLPROOF_TOKEN);
+  const [rows, projects] = await Promise.all([
+    trackerRows(secrets.SUPABASE_ACCESS_TOKEN, [...sites.values()].map((s) => s.id)),
+    authProjects(secrets.SUPABASE_ACCESS_TOKEN),
+  ]);
+  const auth = await mapLimit(projects, 6, async (p) => {
+    try { return { host: p.host, ...(await authStats(secrets.SUPABASE_ACCESS_TOKEN, p.ref)) }; }
+    catch (e) { return { host: p.host, error: String(e.message || e).slice(0, 120) }; }
+  });
+
+  const props = assemble({ sites, rows, auth });
+  const s = summarize(props);
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', day: DAY, prev: PREV };
+  const html = renderHtml(props, s, meta);
+  const text = renderText(props, s, meta);
+  const subject = subjectLine(s);
+
+  const out = join(DATA_DIR, 'out');
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(out, { recursive: true });
+  writeFileSync(join(out, 'latest.html'), html);
+  writeFileSync(join(out, 'latest.txt'), text);
+  writeFileSync(join(out, 'latest.json'), JSON.stringify({ meta, subject, properties: props }, null, 1));
+  writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify({ meta, properties: props }));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(out, 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  if (!secrets.RESEND_API_KEY) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(secrets.RESEND_API_KEY, { from: FROM, to: [TO], subject, html, text });
+  console.log(`sent ${id} to ${TO}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`fleet-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = process.env.RESEND_API_KEY || loadSecrets().RESEND_API_KEY;
+      if (key) await resend(key, { from: FROM, to: [TO], subject: 'Fleet nightly FAILED', text: `The nightly fleet report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`fleet-nightly: could not mail the failure either: ${e2.message}`); }
+  }
+  process.exit(1);
+});
