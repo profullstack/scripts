@@ -62,6 +62,14 @@ Fixing (what --apply does; turn it off with --no-fix):
     not an obstacle, and retrying until it passes is how a flaky suite becomes
     a green one that means nothing.
 
+Stacks:
+  GitHub will not merge a PR that belongs to a stack through the GraphQL
+  mutation gh uses, and says so rather than merging. Those PRs go to the
+  asynchronous merge REST endpoint instead, which enqueues the squash and
+  is polled until it settles. The head commit is still pinned and no admin
+  override is used, so eligibility is judged exactly as it is for any other
+  PR. Merge the bottom of a stack first: GitHub retargets what sat on top.
+
 Drafts:
   Draft PRs are included by default. With --apply they are marked ready for
   review, then re-evaluated against the eligibility rules below and merged if
@@ -333,6 +341,76 @@ fetch_metadata() {
   done
 }
 
+# GitHub refuses the GraphQL merge mutation for a pull request that belongs
+# to a stack and points at the asynchronous merge REST endpoint instead. That
+# endpoint enqueues the merge and hands back a uuid to poll, so the squash
+# still happens under the same rules: the head commit stays pinned and no
+# admin override is asked for.
+merge_async() {
+  local pr=$1
+  local pinned_sha=$2
+  local slug number response status uuid attempt message
+
+  if [[ $pr =~ github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+    slug=${BASH_REMATCH[1]}
+    number=${BASH_REMATCH[2]}
+  else
+    printf 'gh-prs-merge: cannot read owner/repo from %s\n' "$pr" >&2
+    return 1
+  fi
+
+  if ! response=$(
+    GH_PAGER=cat gh api \
+      --method PUT \
+      "repos/$slug/pulls/$number/merge-async" \
+      -f merge_method=squash \
+      -f "sha=$pinned_sha" \
+      2>&1
+  ); then
+    printf '%s\n' "$response" >&2
+    return 1
+  fi
+
+  status=$(jq -r '.status // empty' <<< "$response" 2>/dev/null)
+  uuid=$(jq -r '.details.uuid // empty' <<< "$response" 2>/dev/null)
+
+  # The merge runs in the background, so poll until it settles. A PR handed
+  # to a merge queue reports enqueued, which is as done as this tool gets.
+  for ((attempt = 30; attempt > 0; attempt--)); do
+    case $status in
+      merged|enqueued)
+        return 0
+        ;;
+      failed)
+        message=$(
+          jq -r '.details.message // "no reason given"' <<< "$response"
+        )
+        printf 'gh-prs-merge: async merge failed — %s\n' "$message" >&2
+        return 1
+        ;;
+    esac
+
+    [[ -n $uuid ]] || break
+
+    sleep 2
+
+    if ! response=$(
+      GH_PAGER=cat gh api \
+        "repos/$slug/pulls/$number/merge-async/$uuid" \
+        2>&1
+    ); then
+      printf '%s\n' "$response" >&2
+      return 1
+    fi
+
+    status=$(jq -r '.status // empty' <<< "$response" 2>/dev/null)
+  done
+
+  printf 'gh-prs-merge: async merge never settled (status=%s)\n' \
+    "${status:-unknown}" >&2
+  return 1
+}
+
 # Splits $metadata into the fields the eligibility rules read.
 parse_metadata() {
   state=$(jq -r '.state' <<< "$metadata")
@@ -569,13 +647,23 @@ for pr in "${prs[@]}"; do
 
   if ((apply)); then
     # Deliberately no --admin: GitHub rules and protections remain enforced.
-    if GH_PAGER=cat gh pr merge "$pr" \
-      --squash \
-      --match-head-commit "$head_sha"
-    then
+    if merge_output=$(
+      GH_PAGER=cat gh pr merge "$pr" \
+        --squash \
+        --match-head-commit "$head_sha" \
+        2>&1
+    ); then
+      printf '%s\n' "$merge_output"
       printf 'MERGED %s\n' "$pr"
       ((merged += 1))
+    elif [[ $merge_output == *"asynchronous merge REST API"* ]] &&
+         merge_async "$pr" "$head_sha"
+    then
+      # A stacked PR: the mutation is closed to it, the REST endpoint is not.
+      printf 'MERGED %s — via the asynchronous merge API (stacked)\n' "$pr"
+      ((merged += 1))
     else
+      printf '%s\n' "$merge_output" >&2
       printf 'FAILED %s — GitHub refused the merge\n' "$pr" >&2
       ((failed += 1))
     fi
