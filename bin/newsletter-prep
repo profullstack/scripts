@@ -231,10 +231,35 @@ async function main() {
   mkdirSync(DATA, { recursive: true });
   const p = plan();
   const issue = pick(p);
-  if (!issue) { console.log('Nothing due yet.'); return; }
+  if (!issue) {
+    const left = p.sends.filter((s) => !s.sent);
+    if (!left.length && !existsSync(join(DATA, 'wrapped'))) {
+      let numbers = '';
+      try { numbers = sh('newsletter-abtest', ['--print']); } catch { numbers = '(the digest would not run)'; }
+      await mail('Newsletter campaign: that was the last issue', [
+        'Every issue in the plan has gone out. Where it landed:', '', numbers, '',
+        'To keep going, add dates to ~/.config/newsletter-abtest/plan.json.',
+        'To stop the daily mail: crontab -e, delete the newsletter-abtest and newsletter-prep lines.',
+      ].join('\n'));
+      writeFileSync(join(DATA, 'wrapped'), `${new Date().toISOString()}\n`);
+    }
+    console.log('Nothing due yet.');
+    return;
+  }
 
   const file = join(DRAFTS, `${issue.id}.md`);
   if (existsSync(file) && !has('--force') && !has('--dry-run')) { console.log(`${issue.id} is already drafted at ${file}. --force redoes it.`); return; }
+
+  // 003 and 004 name a set that only exists once an earlier issue decides it.
+  let ctaSet = issue.ctaSet ?? 'default';
+  let ctaNote = '';
+  try {
+    const sets = sh('myna', ['newsletter', 'cta', 'list']);
+    if (!new RegExp(`^${ctaSet}:`, 'm').test(sets)) {
+      ctaNote = `The plan asks for the "${ctaSet}" CTA set, which does not exist yet, so this used "default". Create it with: myna newsletter cta add "<label>" <url> --set ${ctaSet}`;
+      ctaSet = 'default';
+    }
+  } catch { /* if the list cannot be read, let blast complain */ }
 
   const from = since(p, issue);
   console.log(`Preparing ${issue.id} for ${issue.date}, material since ${from}`);
@@ -258,7 +283,7 @@ async function main() {
   const subject = (md.match(/^##\s+(.+)$/m) || [])[1] || `Profullstack news, ${issue.date}`;
   const create = [
     'newsletter', 'blast', file, '--id', issue.id, '--list', issue.list ?? 'profullstack-users',
-    '--subject', `Profullstack: ${subject}`, '--cta-set', issue.ctaSet ?? 'default',
+    '--subject', `Profullstack: ${subject}`, '--cta-set', ctaSet,
     '--via', 'resend', '--service', 'a Profullstack, Inc. product', '--reply-to', TO,
   ];
   if (issue.subjectB) create.push('--subject-b', issue.subjectB);
@@ -271,6 +296,7 @@ async function main() {
     `Goes out: ${issue.date}. Tests: ${issue.test ?? 'n/a'}`,
     `Material: ${material.blogPosts.length} blog posts, ${material.githubReleases.length} releases since ${from}.`,
     bad.length ? `Dropped for dead links: ${bad.join(', ')}` : 'Every link checked out.',
+    ctaNote,
     stillBad.length ? `STILL BROKEN, fix before sending: ${stillBad.join(', ')}` : '',
     '',
     'Read the test copy. If it is right, one line schedules it and the daemon sends it:',
