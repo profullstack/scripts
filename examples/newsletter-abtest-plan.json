@@ -1,0 +1,10 @@
+{
+  "campaign": "Profullstack monthly A/B, 4 issues, weekly",
+  "note": "Two arms per issue, never eight: at a 1% click rate a 5,140 list can only settle a big gap.",
+  "sends": [
+    { "id": "profullstack-001", "date": "2026-09-24", "sent": true,  "ctaSet": "default",  "test": "2 subjects x 4 CTAs, 8 arms of ~640. Too thin to call, but it pointed at the CTA." },
+    { "id": "profullstack-002", "date": "2026-10-01", "sent": false, "ctaSet": "cta-duel", "test": "one subject, 2 CTAs of ~2,570: Schedule a call against Book a demo. Needs ~2,200 an arm, so this one can actually be called." },
+    { "id": "profullstack-003", "date": "2026-10-08", "sent": false, "ctaSet": "winner",   "test": "winning CTA fixed, 2 subject styles of ~2,570: what shipped against the named-product line." },
+    { "id": "profullstack-004", "date": "2026-10-15", "sent": false, "ctaSet": "winner",   "test": "winner on both, 2 preheaders of ~2,570, and the month pooled for the final read." }
+  ]
+}

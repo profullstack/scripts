@@ -1,0 +1,278 @@
+#!/usr/bin/env node
+// newsletter-abtest — one email a day while a newsletter A/B test is running.
+//
+//   newsletter-abtest              snapshot every issue, mail the digest
+//   newsletter-abtest --dry-run    build it, print it, send nothing
+//   newsletter-abtest --print      snapshot and print, no mail
+//   newsletter-abtest --prefix X   issues whose id starts with X (default profullstack-)
+//   newsletter-abtest --to a@b.com someone else
+//
+// Why a daily snapshot and not a single reading at the end: opens and clicks
+// arrive for days after a send, so the only way to tell a real winner from an
+// early lead is to watch the same numbers move. Each run appends one line per
+// issue to snapshots.jsonl and reports the change since the run before.
+//
+// The verdict is a two-proportion z test on clicks, pooled across every issue
+// of the campaign, because one issue's arms are far too small on their own:
+// at a 1% click rate you need thousands per arm to separate them. When the
+// arms are not separable the digest says so and prints the n it would take.
+//
+// Secrets: RESEND_API_KEY from the environment, else the team vault, else
+// ~/.config/logicsrc/shell.env. Cron gets almost no environment, so PATH is
+// fixed below and a failure is mailed too: a silent nightly job is worse than
+// none.
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+].join(':');
+
+const args = process.argv.slice(2);
+const has = (f) => args.includes(f);
+const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
+
+const PREFIX = val('--prefix', 'profullstack-');
+const TO = val('--to', 'anthony@profullstack.com');
+const FROM = 'Newsletter A/B <anthony@profullstack.com>';
+const DATA = join(homedir(), '.local/share/newsletter-abtest');
+const SNAPSHOTS = join(DATA, 'snapshots.jsonl');
+const PLAN = join(homedir(), '.config/newsletter-abtest/plan.json');
+
+// ---------------------------------------------------------------- myna
+
+const myna = (...a) => execFileSync('myna', a, { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 << 20 });
+
+function issues() {
+  const all = JSON.parse(myna('newsletter', '--json'));
+  return all.filter((n) => n.id.startsWith(PREFIX) && n.status !== 'draft');
+}
+
+function stats(id) {
+  return JSON.parse(myna('newsletter', 'stats', id, '--json'));
+}
+
+// ---------------------------------------------------------------- statistics
+
+/** Standard normal tail, Abramowitz and Stegun 26.2.17; good to 7 decimals. */
+function phi(z) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989422804014327 * Math.exp((-z * z) / 2);
+  const p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return z > 0 ? 1 - p : p;
+}
+
+/** Two-sided p for two proportions: successes a of na against b of nb. */
+function twoProportion(a, na, b, nb) {
+  if (!na || !nb) return { p: 1, z: 0 };
+  const p1 = a / na, p2 = b / nb, pooled = (a + b) / (na + nb);
+  const se = Math.sqrt(pooled * (1 - pooled) * (1 / na + 1 / nb));
+  if (!se) return { p: 1, z: 0 };
+  const z = (p1 - p2) / se;
+  return { p: 2 * (1 - phi(Math.abs(z))), z };
+}
+
+/** Recipients per arm for 80% power at alpha 0.05, given two observed rates. */
+function needPerArm(p1, p2) {
+  if (p1 === p2) return Infinity;
+  const n = (7.849 * (p1 * (1 - p1) + p2 * (1 - p2))) / ((p1 - p2) ** 2);
+  return Math.ceil(n);
+}
+
+const pct = (x) => `${(x * 100).toFixed(2)}%`;
+const plus = (n) => (n > 0 ? `+${n}` : `${n}`);
+
+/** Sum rows into one arm. */
+function fold(rows) {
+  return rows.reduce((t, r) => ({
+    sent: t.sent + r.sent, opens: t.opens + r.opens, opensTotal: t.opensTotal + r.opensTotal,
+    clicks: t.clicks + r.clicks, unsubscribes: t.unsubscribes + r.unsubscribes,
+  }), { sent: 0, opens: 0, opensTotal: 0, clicks: 0, unsubscribes: 0 });
+}
+
+/** Group pooled rows by a key, best click rate first. */
+function arms(rows, key) {
+  const by = new Map();
+  for (const r of rows) {
+    const k = r[key];
+    if (!by.has(k)) by.set(k, []);
+    by.get(k).push(r);
+  }
+  return [...by.entries()]
+    .map(([name, rs]) => ({ name, ...fold(rs) }))
+    .map((a) => ({ ...a, ctr: a.sent ? a.clicks / a.sent : 0, openRate: a.sent ? a.opens / a.sent : 0 }))
+    .sort((x, y) => y.ctr - x.ctr);
+}
+
+/** The verdict line for a set of arms: a winner, or what it would take. */
+function verdict(list, label) {
+  if (list.length < 2) return `${label}: only one arm so far.`;
+  const [top, next] = list;
+  const { p } = twoProportion(top.clicks, top.sent, next.clicks, next.sent);
+  if (p < 0.05) return `${label}: ${top.name} beats ${next.name} on clicks, ${pct(top.ctr)} against ${pct(next.ctr)} (p = ${p.toFixed(3)}). Call it.`;
+  const need = needPerArm(top.ctr, next.ctr);
+  const short = Math.max(0, need - top.sent);
+  const more = Number.isFinite(need)
+    ? `about ${need.toLocaleString()} per arm would settle it, ${short ? `${short.toLocaleString()} more than ${top.name} has` : 'which it now has'}`
+    : 'the two are level';
+  return `${label}: ${top.name} leads at ${pct(top.ctr)} against ${pct(next.ctr)}, but that gap is noise so far (p = ${p.toFixed(2)}); ${more}.`;
+}
+
+// ---------------------------------------------------------------- the plan
+
+/** The month's sends, so the digest says what is due. Absent: no schedule block. */
+function plan() {
+  if (!existsSync(PLAN)) return null;
+  try { return JSON.parse(readFileSync(PLAN, 'utf8')); } catch { return null; }
+}
+
+function scheduleLines(p) {
+  if (!p?.sends?.length) return [];
+  const today = new Date().toISOString().slice(0, 10);
+  const lines = [];
+  for (const s of p.sends) {
+    const days = Math.round((Date.parse(`${s.date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86400000);
+    const when = s.sent ? 'sent' : days === 0 ? 'DUE TODAY' : days < 0 ? `${-days} days overdue` : `in ${days} days`;
+    lines.push(`  ${s.date}  ${s.id.padEnd(18)} ${when}`);
+  }
+  return lines;
+}
+
+// ---------------------------------------------------------------- the report
+
+function build({ record = true } = {}) {
+  const list = issues();
+  const now = new Date().toISOString();
+  const previous = readSnapshots();
+  const sections = [];
+  const pooled = [];
+
+  for (const n of list) {
+    const s = stats(n.id);
+    const total = fold(s.rows);
+    const before = previous.filter((x) => x.id === n.id).pop();
+    const delta = before
+      ? {
+          opens: total.opens - before.total.opens,
+          clicks: total.clicks - before.total.clicks,
+          unsubscribes: total.unsubscribes - before.total.unsubscribes,
+          hours: Math.max(1, Math.round((Date.parse(now) - Date.parse(before.at)) / 3_600_000)),
+        }
+      : null;
+    if (record) appendFileSync(SNAPSHOTS, `${JSON.stringify({ at: now, id: n.id, total, rows: s.rows })}\n`);
+    pooled.push(...s.rows);
+    sections.push({ id: n.id, subject: n.subject, rows: s.rows, total, delta });
+  }
+
+  const lines = [];
+  lines.push(`Newsletter A/B, ${now.slice(0, 10)}`);
+  lines.push('');
+
+  for (const sec of sections) {
+    const t = sec.total;
+    lines.push(`${sec.id}  ${sec.subject}`);
+    lines.push(`  ${t.sent.toLocaleString()} sent, ${t.opens} opens (${pct(t.sent ? t.opens / t.sent : 0)}), ${t.clicks} clicks (${pct(t.sent ? t.clicks / t.sent : 0)}), ${t.unsubscribes} unsubscribed`);
+    if (sec.delta) lines.push(`  in the last ${sec.delta.hours}h: ${plus(sec.delta.opens)} opens, ${plus(sec.delta.clicks)} clicks, ${plus(sec.delta.unsubscribes)} unsubscribes`);
+    else lines.push('  first reading, so no change to show yet');
+    lines.push('');
+  }
+
+  if (pooled.length) {
+    const bySubject = arms(pooled, 'subjectKey');
+    const byCta = arms(pooled, 'cta');
+    lines.push('Pooled across every issue');
+    lines.push('');
+    lines.push('  Subject line');
+    for (const a of bySubject) lines.push(`    ${a.name}  ${a.sent.toLocaleString()} sent  ${a.opens} opens  ${a.clicks} clicks  ${pct(a.ctr)} CTR  ${a.unsubscribes} unsubs`);
+    lines.push(`    ${verdict(bySubject, 'Verdict')}`);
+    lines.push('');
+    lines.push('  Call to action');
+    for (const a of byCta) lines.push(`    ${a.name.padEnd(18)} ${a.sent.toLocaleString()} sent  ${a.opens} opens  ${a.clicks} clicks  ${pct(a.ctr)} CTR  ${a.unsubscribes} unsubs`);
+    lines.push(`    ${verdict(byCta, 'Verdict')}`);
+    lines.push('');
+  }
+
+  const p = plan();
+  const sched = scheduleLines(p);
+  if (sched.length) {
+    lines.push('This month');
+    lines.push(...sched);
+    const due = p.sends.find((s) => !s.sent);
+    if (due) {
+      lines.push('');
+      lines.push(`  ${due.id}: ${due.test ?? ''}`);
+      lines.push(`    myna newsletter blast <draft.md> --id ${due.id} --list ${due.list ?? 'profullstack-users'} \\`);
+      lines.push(`      --subject "..." --cta-set ${due.ctaSet ?? 'default'} --via resend --service "a Profullstack, Inc. product"`);
+      lines.push(`    then, once the test copy looks right:  myna newsletter blast --go ${due.id}`);
+    }
+    lines.push('');
+  }
+
+  lines.push(`Opens undercount: Apple Mail and Gmail hide the pixel for many readers, so clicks are the firmer number.`);
+  lines.push(`From ${hostname()}. Stop these with: crontab -e, delete the newsletter-abtest line.`);
+  return lines.join('\n');
+}
+
+function readSnapshots() {
+  if (!existsSync(SNAPSHOTS)) return [];
+  return readFileSync(SNAPSHOTS, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+// ---------------------------------------------------------------- mail
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/i);
+    if (m) out[m[1]] = m[2].replace(/^['"]|['"]$/g, '').trim();
+  }
+  return out;
+}
+
+function resendKey() {
+  if (process.env.RESEND_API_KEY) return process.env.RESEND_API_KEY;
+  const dir = mkdtempSync(join(tmpdir(), 'newsletter-abtest-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 60_000 });
+    const k = parseEnv(readFileSync(join(dir, 'env'), 'utf8')).RESEND_API_KEY;
+    if (k) return k;
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  if (existsSync(f)) return parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY;
+  return null;
+}
+
+async function mail(subject, text) {
+  const key = resendKey();
+  if (!key) throw new Error('No RESEND_API_KEY in the environment, the vault or shell.env');
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ from: FROM, to: [TO], subject, text, html: `<pre style="font:14px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap">${text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])}</pre>` }),
+  });
+  if (!r.ok) throw new Error(`resend ${r.status}: ${(await r.text()).slice(0, 300)}`);
+}
+
+// ---------------------------------------------------------------- main
+
+async function main() {
+  mkdirSync(DATA, { recursive: true });
+  let report;
+  try {
+    report = build({ record: !has('--dry-run') });
+  } catch (e) {
+    report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
+    if (!has('--dry-run') && !has('--print')) await mail('Newsletter A/B: the digest failed', report);
+    console.error(report);
+    process.exit(1);
+  }
+  if (has('--dry-run') || has('--print')) { console.log(report); return; }
+  await mail(`Newsletter A/B, ${new Date().toISOString().slice(0, 10)}`, report);
+  console.log(report);
+}
+
+main().catch((e) => { console.error(e?.stack || e); process.exit(1); });
