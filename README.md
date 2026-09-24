@@ -304,6 +304,30 @@ membership in a group that can read the journal (`adm` on Ubuntu).
 `install.sh` itself needs only POSIX `sh` and `git` — deliberately, since it is
 the one file that runs before anything else is installed.
 
+## newsletter-abtest
+
+One email a day while a newsletter A/B test is running: every issue's sent,
+opens, clicks and unsubscribes, what moved since the last reading, and the
+arms pooled across the whole campaign with a two-proportion z test on clicks.
+
+Opens and clicks keep arriving for days after a send, so a single reading at
+the end cannot tell a real winner from an early lead. The verdict line says
+when a gap is real, and when it is not it prints the recipients per arm it
+would take, which is usually the more useful number: a 5,140 list settles a
+0.6% against 1.4% gap in one send, and never settles 0.93% against 1.18%.
+
+```
+newsletter-abtest              snapshot every issue, mail the digest
+newsletter-abtest --dry-run    build and print it, record nothing, send nothing
+newsletter-abtest --print      snapshot and print, no mail
+newsletter-abtest --prefix X   issues whose id starts with X (default profullstack-)
+```
+
+The month's sends live in `~/.config/newsletter-abtest/plan.json`; see
+`examples/newsletter-abtest-plan.json`. Each entry gives the issue id, its
+date, the CTA set and one line on what that issue tests, and the digest prints
+the `myna newsletter blast` command for whichever is next. Cron it daily and
+delete the line when the campaign is over.
 ## newsletter-prep
 
 Drafts the next issue of a running newsletter campaign by itself, three days
