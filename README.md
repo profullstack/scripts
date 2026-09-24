@@ -328,3 +328,42 @@ The month's sends live in `~/.config/newsletter-abtest/plan.json`; see
 date, the CTA set and one line on what that issue tests, and the digest prints
 the `myna newsletter blast` command for whichever is next. Cron it daily and
 delete the line when the campaign is over.
+## newsletter-prep
+
+Drafts the next issue of a running newsletter campaign by itself, three days
+before its date, and mails a test copy. It stops there: a person reads the
+test copy and says go.
+
+```
+newsletter-prep              prepare the next issue due within 3 days
+newsletter-prep --days 5     look further ahead
+newsletter-prep --id X       that issue, whatever its date
+newsletter-prep --dry-run    gather and draft, create nothing, mail nothing
+newsletter-prep --force      redo one already drafted
+```
+
+It reads the campaign from `~/.config/newsletter-abtest/plan.json` (`--plan`
+for a trial run against a copy), gathers
+every blog post and GitHub release since the previous issue, has claude write
+the prose from that material and nothing else, then checks every link itself
+and drops the bullets whose links are dead. The issue is created in myna with
+that issue's A/B design and one test copy goes out.
+
+Give the plan a `recurring` block and the schedule keeps itself going: each
+run marks off whatever myna has actually sent, and tops the plan up so there
+is always a future issue on the books. Without that reconciliation the `sent`
+flags never flip, the same issue stays next forever and the schedule stalls
+after one send.
+
+```json
+"recurring": { "everyDays": 7, "keepAhead": 1, "keepSent": 12,
+               "idPrefix": "profullstack-", "list": "profullstack-users",
+               "ctaSet": "winner" }
+```
+
+Two things it will not do. It will not put age gated or adult material in a
+newsletter to every customer, whatever the feeds say: the first automatic
+draft pulled in a 21+ cigar post on its own, which is what `EXCLUDE_WORDS` is
+for. And it will not send to the list. The send reaches thousands of people
+and cannot be recalled, so the last step is a person reading the test copy and
+running one line, after which the myna daemon sends it at its hour.

@@ -1,0 +1,385 @@
+#!/usr/bin/env node
+// newsletter-prep — draft the next issue of a running campaign, by itself.
+//
+//   newsletter-prep                 prepare the next issue that is due soon
+//   newsletter-prep --days 5        how far ahead to look (default 3)
+//   newsletter-prep --id X          that issue, whatever its date
+//   newsletter-prep --dry-run       gather and draft, create nothing, mail nothing
+//   newsletter-prep --force         redo one already prepared
+//   newsletter-prep --plan F        a different plan file, for a trial run
+//
+// It gathers what actually shipped since the last issue, has claude write the
+// prose from that material and nothing else, checks every link itself, creates
+// the issue in myna and mails one test copy. Then it stops and mails the one
+// line that schedules it.
+//
+// It stops there on purpose. The send reaches thousands of customers and
+// cannot be recalled, and an unread draft is where a wrong claim gets out: the
+// first issue's draft named a 404 install link, a parked domain and a site we
+// keep out of these, all found by checking rather than by writing. So a person
+// reads the test copy, says go, and the myna daemon sends it at its hour.
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+].join(':');
+
+const args = process.argv.slice(2);
+const has = (f) => args.includes(f);
+const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
+
+const PLAN = val('--plan', join(homedir(), '.config/newsletter-abtest/plan.json'));
+const DRAFTS = join(homedir(), 'blog-drafts');
+const DATA = join(homedir(), '.local/share/newsletter-abtest');
+const TO = 'anthony@profullstack.com';
+const FROM = 'Newsletter prep <anthony@profullstack.com>';
+
+// Feeds worth reading. Anything not ours, parked, or adult stays out.
+const FEEDS = [
+  ['Chovy', 'https://dev.profullstack.com/~anthony/blog/feed.xml'],
+  ['LogicSRC', 'https://logicsrc.com/blog/rss.xml'],
+  ['PairUX', 'https://pairux.com/blog/rss.xml'],
+  ['ugig', 'https://ugig.net/blog/rss.xml'],
+  ['CoinPay', 'https://coinpayportal.com/blog/rss.xml'],
+  ['ThreatCrush', 'https://threatcrush.com/blog/rss.xml'],
+  ['sh1pt', 'https://sh1pt.com/blog/rss.xml'],
+  ['qrypt.chat', 'https://qrypt.chat/blog/rss.xml'],
+];
+const ORGS = ['profullstack', 'moshcoder'];
+
+// Kept out of a newsletter to every customer, whatever the feeds say. Age
+// gated or adult (cigars, torrents), and the blogs that are ours but private.
+// The first auto draft pulled in a 21+ cigar post on its own, which is the
+// whole reason this list exists.
+const EXCLUDE_URL = ['cigarunderground', 'undergroundcigars', 'bittorrented', 'd0rz.com/adult'];
+const EXCLUDE_WORDS = ['cigar', 'spliff', 'herf', 'torrent', 'nsfw', 'adult', '21+', 'cannabis'];
+
+const allowed = (item) => {
+  const url = (item.link || '').toLowerCase();
+  const text = `${item.title || ''} ${item.tag || ''} ${item.summary || ''} ${item.repo || ''}`.toLowerCase();
+  if (EXCLUDE_URL.some((u) => url.includes(u))) return false;
+  return !EXCLUDE_WORDS.some((w) => text.includes(w));
+};
+
+const sh = (cmd, a, opts = {}) => execFileSync(cmd, a, { encoding: 'utf8', timeout: 180_000, maxBuffer: 32 << 20, ...opts });
+
+// ---------------------------------------------------------------- the plan
+
+function plan() {
+  if (!existsSync(PLAN)) throw new Error(`No plan at ${PLAN}`);
+  return JSON.parse(readFileSync(PLAN, 'utf8'));
+}
+
+/** myna is the truth about what went out; the plan only mirrors it. Without
+ * this the plan's `sent` flags never flip, the same issue stays "next"
+ * forever and the schedule stalls after one send. */
+function reconcile(p) {
+  let live = [];
+  try { live = JSON.parse(sh('myna', ['newsletter', '--json'])); } catch { return false; }
+  const status = new Map(live.map((n) => [n.id, n.status]));
+  let changed = false;
+  for (const s of p.sends) {
+    if (!s.sent && status.get(s.id) === 'sent') { s.sent = true; changed = true; }
+  }
+  return changed;
+}
+
+/** Keep a future issue on the books. Weekly, forever, unless recurring is off. */
+function rollForward(p) {
+  const r = p.recurring;
+  if (!r || r.everyDays === 0) return false;
+  const every = Number(r.everyDays) || 7;
+  const horizon = Number(r.keepAhead) || 1;
+  const today = new Date().toISOString().slice(0, 10);
+  let changed = false;
+
+  const upcoming = () => p.sends.filter((s) => !s.sent && s.date >= today).length;
+  let guard = 0;
+  while (upcoming() < horizon && guard++ < 12) {
+    const last = p.sends[p.sends.length - 1];
+    const next = new Date(Date.parse(`${last.date}T00:00:00Z`) + every * 86400000).toISOString().slice(0, 10);
+    const n = Math.max(...p.sends.map((s) => Number((s.id.match(/(\d+)$/) || [])[1] || 0))) + 1;
+    p.sends.push({
+      id: `${r.idPrefix || 'profullstack-'}${String(n).padStart(3, '0')}`,
+      date: next,
+      sent: false,
+      list: r.list || last.list,
+      ctaSet: r.ctaSet || 'default',
+      test: r.test || 'two arms, whatever the last issue left undecided',
+    });
+    changed = true;
+  }
+
+  // The plan is a schedule, not an archive: myna holds the history.
+  const keep = Number(r.keepSent) || 12;
+  const sent = p.sends.filter((s) => s.sent);
+  if (sent.length > keep) {
+    const drop = new Set(sent.slice(0, sent.length - keep).map((s) => s.id));
+    p.sends = p.sends.filter((s) => !drop.has(s.id));
+    changed = true;
+  }
+  return changed;
+}
+
+function savePlan(p) {
+  writeFileSync(PLAN, `${JSON.stringify(p, null, 2)}\n`);
+}
+
+/** The issue to prepare: --id, else the first unsent one due within --days. */
+function pick(p) {
+  const wanted = val('--id', null);
+  if (wanted) return p.sends.find((s) => s.id === wanted) ?? (() => { throw new Error(`No ${wanted} in the plan`); })();
+  const days = Number(val('--days', '3'));
+  const today = Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`);
+  return p.sends.find((s) => !s.sent && (Date.parse(`${s.date}T00:00:00Z`) - today) / 86400000 <= days) ?? null;
+}
+
+/** What the previous issue covered, so this one starts where that ended. */
+function since(p, issue) {
+  const i = p.sends.findIndex((s) => s.id === issue.id);
+  const prev = i > 0 ? p.sends[i - 1] : null;
+  return prev?.date ?? new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------- material
+
+async function fetchText(url, ms = 20_000) {
+  const c = AbortSignal.timeout(ms);
+  const r = await fetch(url, { signal: c, redirect: 'follow', headers: { 'user-agent': 'newsletter-prep (profullstack)' } });
+  if (!r.ok) throw new Error(`${r.status}`);
+  return await r.text();
+}
+
+/** Items published on or after `from`, from a feed that may be RSS or Atom. */
+function feedItems(xml, from) {
+  const out = [];
+  const blocks = xml.split(/<(?:item|entry)[\s>]/).slice(1);
+  for (const b of blocks) {
+    const pick1 = (re) => (b.match(re) || [])[1]?.replace(/<!\[CDATA\[|\]\]>/g, '').trim();
+    const title = pick1(/<title[^>]*>([\s\S]*?)<\/title>/);
+    const link = pick1(/<link[^>]*>([\s\S]*?)<\/link>/) || (b.match(/<link[^>]*href="([^"]+)"/) || [])[1];
+    const date = pick1(/<(?:pubDate|published|updated)[^>]*>([\s\S]*?)<\/(?:pubDate|published|updated)>/);
+    const desc = pick1(/<(?:description|summary)[^>]*>([\s\S]*?)<\/(?:description|summary)>/) || '';
+    if (!title || !link || !date) continue;
+    const when = new Date(date);
+    if (isNaN(when) || when < new Date(from)) continue;
+    out.push({ title, link, date: when.toISOString().slice(0, 10), summary: desc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 300) });
+  }
+  return out;
+}
+
+async function blogMaterial(from) {
+  const found = [];
+  await Promise.all(FEEDS.map(async ([name, url]) => {
+    try { for (const it of feedItems(await fetchText(url), from)) found.push({ source: name, ...it }); }
+    catch { /* a feed that is down is not worth failing the run over */ }
+  }));
+  return found.filter(allowed).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function githubMaterial(from) {
+  const out = [];
+  for (const org of ORGS) {
+    let repos = [];
+    try {
+      repos = JSON.parse(sh('gh', ['api', `orgs/${org}/repos?per_page=100&sort=pushed`, '--jq',
+        `[.[] | select(.pushed_at >= "${from}") | {name: .full_name, stars: .stargazers_count}]`]));
+    } catch { continue; }
+    for (const r of repos.slice(0, 25)) {
+      try {
+        const rel = JSON.parse(sh('gh', ['api', `repos/${r.name}/releases?per_page=5`, '--jq',
+          `[.[] | select(.published_at >= "${from}") | {tag: .tag_name, url: .html_url, body: .body, at: .published_at}]`]));
+        for (const x of rel) out.push({ repo: r.name, stars: r.stars, tag: x.tag, link: x.url, date: x.at.slice(0, 10), summary: (x.body || '').replace(/\r/g, '').split('\n').filter(Boolean).slice(0, 6).join(' ').slice(0, 400) });
+      } catch { /* no releases, or no access */ }
+    }
+  }
+  return out.filter(allowed).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+// ---------------------------------------------------------------- drafting
+
+const PROMPT = `You are writing one issue of the Profullstack, Inc. newsletter. It goes to about 5,000 people who each have an account on one of our products (ugig.net, smshub.dev, PairUX, CrawlProof, moshcode and others).
+
+Use ONLY the material below. Do not invent a product, a number, a feature or a URL. If the material is thin, write a shorter issue.
+
+Structure, as Markdown:
+- One short greeting line, then one sentence saying what this issue covers.
+- 2 to 4 sections with "## " headings. Group the material: what shipped, what we wrote, what is on GitHub. Drop a section with nothing real in it.
+- Bullets, at most 5 in a section. Each bullet: a bold [name](url) link, then one or two plain sentences saying what it does and who it is for. Concrete over abstract.
+- Choose what a customer would actually open or try. A bug fix inside a library is not worth a bullet; a thing they can use is. Where several releases are the same story, write one bullet for the story and link the clearest one.
+- Then a line with only: {{cta}}
+- Then one closing line inviting a reply, and the sign-off "Anthony Ettinger, Profullstack, Inc."
+
+Style rules, all of them hard:
+- No em dashes and no en dashes anywhere. Use a comma, a colon or a full stop.
+- No hype words: revolutionary, seamless, powerful, cutting-edge, game-changing, unlock, elevate.
+- Never the "not just X but Y" construction.
+- Short sentences. Specifics, numbers and names over adjectives.
+- Do not mention this is AI written, and do not address the reader as "folks".
+- Every URL must be copied exactly from the material. Never shorten or guess one.
+
+Output the Markdown and nothing else: no preamble, no code fence.`;
+
+function draft(material, issue) {
+  const input = `${PROMPT}\n\nThis issue is ${issue.id}, going out ${issue.date}.\n\nMATERIAL\n${JSON.stringify(material, null, 1)}`;
+  return sh('claude', ['-p', '--allowed-tools', ''], { input, timeout: 900_000 }).trim();
+}
+
+// ---------------------------------------------------------------- checking
+
+const urlsIn = (md) => [...new Set([...md.matchAll(/\((https?:\/\/[^)\s]+)\)/g)].map((m) => m[1]))];
+
+async function checkLinks(md) {
+  const bad = [];
+  await Promise.all(urlsIn(md).map(async (u) => {
+    try {
+      const r = await fetch(u, { method: 'GET', redirect: 'follow', signal: AbortSignal.timeout(20_000), headers: { 'user-agent': 'newsletter-prep (profullstack)' } });
+      if (!r.ok) bad.push(`${u} -> ${r.status}`);
+    } catch (e) { bad.push(`${u} -> ${String(e).slice(0, 60)}`); }
+  }));
+  return bad;
+}
+
+/** Bullets whose link is dead come out; a dead link in the prose is reported. */
+function dropBadLines(md, bad) {
+  const dead = new Set(bad.map((b) => b.split(' -> ')[0]));
+  return md.split('\n').filter((line) => !(/^\s*[-*]\s/.test(line) && [...dead].some((u) => line.includes(u)))).join('\n');
+}
+
+// ---------------------------------------------------------------- mail
+
+function parseEnv(t) { const o = {}; for (const l of t.split('\n')) { const m = l.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/i); if (m) o[m[1]] = m[2].replace(/^['"]|['"]$/g, '').trim(); } return o; }
+
+function resendKey() {
+  if (process.env.RESEND_API_KEY) return process.env.RESEND_API_KEY;
+  const dir = mkdtempSync(join(tmpdir(), 'newsletter-prep-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: ['ignore', 'ignore', 'ignore'], timeout: 60_000 });
+    const k = parseEnv(readFileSync(join(dir, 'env'), 'utf8')).RESEND_API_KEY;
+    if (k) return k;
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  if (existsSync(f)) return parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY;
+  return null;
+}
+
+async function mail(subject, text) {
+  const key = resendKey();
+  if (!key) throw new Error('No RESEND_API_KEY in the environment, the vault or shell.env');
+  const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ from: FROM, to: [TO], subject, text, html: `<pre style="font:14px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap">${esc(text)}</pre>` }),
+  });
+  if (!r.ok) throw new Error(`resend ${r.status}: ${(await r.text()).slice(0, 300)}`);
+}
+
+// ---------------------------------------------------------------- main
+
+async function main() {
+  mkdirSync(DRAFTS, { recursive: true });
+  mkdirSync(DATA, { recursive: true });
+  const p = plan();
+  const touched = [reconcile(p), rollForward(p)].some(Boolean);
+  if (touched && !has('--dry-run')) savePlan(p);
+  const issue = pick(p);
+  if (!issue) {
+    const left = p.sends.filter((s) => !s.sent);
+    if (!left.length && !p.recurring && !existsSync(join(DATA, 'wrapped'))) {
+      let numbers = '';
+      try { numbers = sh('newsletter-abtest', ['--print']); } catch { numbers = '(the digest would not run)'; }
+      await mail('Newsletter campaign: that was the last issue', [
+        'Every issue in the plan has gone out. Where it landed:', '', numbers, '',
+        'To keep going, add dates to ~/.config/newsletter-abtest/plan.json.',
+        'To stop the daily mail: crontab -e, delete the newsletter-abtest and newsletter-prep lines.',
+      ].join('\n'));
+      writeFileSync(join(DATA, 'wrapped'), `${new Date().toISOString()}\n`);
+    }
+    console.log('Nothing due yet.');
+    return;
+  }
+
+  const file = join(DRAFTS, `${issue.id}.md`);
+  if (existsSync(file) && !has('--force') && !has('--dry-run')) { console.log(`${issue.id} is already drafted at ${file}. --force redoes it.`); return; }
+
+  // 003 and 004 name a set that only exists once an earlier issue decides it.
+  let ctaSet = issue.ctaSet ?? 'default';
+  let ctaNote = '';
+  try {
+    const sets = sh('myna', ['newsletter', 'cta', 'list']);
+    if (!new RegExp(`^${ctaSet}:`, 'm').test(sets)) {
+      ctaNote = `The plan asks for the "${ctaSet}" CTA set, which does not exist yet, so this used "default". Create it with: myna newsletter cta add "<label>" <url> --set ${ctaSet}`;
+      ctaSet = 'default';
+    }
+  } catch { /* if the list cannot be read, let blast complain */ }
+
+  const from = since(p, issue);
+  console.log(`Preparing ${issue.id} for ${issue.date}, material since ${from}`);
+  const material = { blogPosts: await blogMaterial(from), githubReleases: githubMaterial(from) };
+  const count = material.blogPosts.length + material.githubReleases.length;
+  if (!count) {
+    await mail(`Newsletter prep: nothing to say for ${issue.id}`, `No blog posts and no releases since ${from}, so ${issue.id} has no material. Either skip it or tell me what to write about.`);
+    console.log('No material.');
+    return;
+  }
+
+  let md = draft(material, issue);
+  const bad = await checkLinks(md);
+  if (bad.length) md = dropBadLines(md, bad);
+  const stillBad = await checkLinks(md);
+
+  if (has('--dry-run')) { console.log(md); if (bad.length) console.log(`\nDead links found: ${bad.join(', ')}`); return; }
+
+  writeFileSync(file, `${md}\n`);
+
+  const subject = (md.match(/^##\s+(.+)$/m) || [])[1] || `Profullstack news, ${issue.date}`;
+  const create = [
+    'newsletter', 'blast', file, '--id', issue.id, '--list', issue.list ?? 'profullstack-users',
+    '--subject', `Profullstack: ${subject}`, '--cta-set', ctaSet,
+    '--via', 'resend', '--service', 'a Profullstack, Inc. product', '--reply-to', TO,
+  ];
+  if (issue.subjectB) create.push('--subject-b', issue.subjectB);
+  let created = '';
+  try { created = sh('myna', create); } catch (e) { created = `FAILED: ${String(e.stdout || e).slice(0, 600)}`; }
+
+  const body = [
+    `${issue.id} is drafted and a test copy is in your inbox.`,
+    '',
+    `Goes out: ${issue.date}. Tests: ${issue.test ?? 'n/a'}`,
+    `Material: ${material.blogPosts.length} blog posts, ${material.githubReleases.length} releases since ${from}.`,
+    bad.length ? `Dropped for dead links: ${bad.join(', ')}` : 'Every link checked out.',
+    ctaNote,
+    stillBad.length ? `STILL BROKEN, fix before sending: ${stillBad.join(', ')}` : '',
+    '',
+    'Read the test copy. If it is right, one line schedules it and the daemon sends it:',
+    `  myna newsletter edit ${issue.id} --at "${issue.date} 09:00"`,
+    '',
+    'To change it first:',
+    `  $EDITOR ${file}`,
+    `  myna newsletter edit ${issue.id} < ${file}`,
+    '',
+    'To send it right now instead:',
+    `  myna newsletter blast --go ${issue.id}`,
+    '',
+    '--- what myna said ---',
+    created.trim(),
+    '',
+    `From ${hostname()}.`,
+  ].filter((l) => l !== '').join('\n');
+
+  await mail(`Newsletter prep: ${issue.id} is ready for you to read`, body);
+  console.log(body);
+}
+
+main().catch(async (e) => {
+  const msg = `newsletter-prep failed on ${hostname()}:\n\n${e?.stack || e}`;
+  console.error(msg);
+  try { await mail('Newsletter prep failed', msg); } catch {}
+  process.exit(1);
+});
