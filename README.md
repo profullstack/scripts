@@ -318,11 +318,24 @@ newsletter-prep --dry-run    gather and draft, create nothing, mail nothing
 newsletter-prep --force      redo one already drafted
 ```
 
-It reads the campaign from `~/.config/newsletter-abtest/plan.json`, gathers
+It reads the campaign from `~/.config/newsletter-abtest/plan.json` (`--plan`
+for a trial run against a copy), gathers
 every blog post and GitHub release since the previous issue, has claude write
 the prose from that material and nothing else, then checks every link itself
 and drops the bullets whose links are dead. The issue is created in myna with
 that issue's A/B design and one test copy goes out.
+
+Give the plan a `recurring` block and the schedule keeps itself going: each
+run marks off whatever myna has actually sent, and tops the plan up so there
+is always a future issue on the books. Without that reconciliation the `sent`
+flags never flip, the same issue stays next forever and the schedule stalls
+after one send.
+
+```json
+"recurring": { "everyDays": 7, "keepAhead": 1, "keepSent": 12,
+               "idPrefix": "profullstack-", "list": "profullstack-users",
+               "ctaSet": "winner" }
+```
 
 Two things it will not do. It will not put age gated or adult material in a
 newsletter to every customer, whatever the feeds say: the first automatic

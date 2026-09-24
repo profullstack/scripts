@@ -6,6 +6,7 @@
 //   newsletter-prep --id X          that issue, whatever its date
 //   newsletter-prep --dry-run       gather and draft, create nothing, mail nothing
 //   newsletter-prep --force         redo one already prepared
+//   newsletter-prep --plan F        a different plan file, for a trial run
 //
 // It gathers what actually shipped since the last issue, has claude write the
 // prose from that material and nothing else, checks every link itself, creates
@@ -32,7 +33,7 @@ const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
 const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
 
-const PLAN = join(homedir(), '.config/newsletter-abtest/plan.json');
+const PLAN = val('--plan', join(homedir(), '.config/newsletter-abtest/plan.json'));
 const DRAFTS = join(homedir(), 'blog-drafts');
 const DATA = join(homedir(), '.local/share/newsletter-abtest');
 const TO = 'anthony@profullstack.com';
@@ -72,6 +73,61 @@ const sh = (cmd, a, opts = {}) => execFileSync(cmd, a, { encoding: 'utf8', timeo
 function plan() {
   if (!existsSync(PLAN)) throw new Error(`No plan at ${PLAN}`);
   return JSON.parse(readFileSync(PLAN, 'utf8'));
+}
+
+/** myna is the truth about what went out; the plan only mirrors it. Without
+ * this the plan's `sent` flags never flip, the same issue stays "next"
+ * forever and the schedule stalls after one send. */
+function reconcile(p) {
+  let live = [];
+  try { live = JSON.parse(sh('myna', ['newsletter', '--json'])); } catch { return false; }
+  const status = new Map(live.map((n) => [n.id, n.status]));
+  let changed = false;
+  for (const s of p.sends) {
+    if (!s.sent && status.get(s.id) === 'sent') { s.sent = true; changed = true; }
+  }
+  return changed;
+}
+
+/** Keep a future issue on the books. Weekly, forever, unless recurring is off. */
+function rollForward(p) {
+  const r = p.recurring;
+  if (!r || r.everyDays === 0) return false;
+  const every = Number(r.everyDays) || 7;
+  const horizon = Number(r.keepAhead) || 1;
+  const today = new Date().toISOString().slice(0, 10);
+  let changed = false;
+
+  const upcoming = () => p.sends.filter((s) => !s.sent && s.date >= today).length;
+  let guard = 0;
+  while (upcoming() < horizon && guard++ < 12) {
+    const last = p.sends[p.sends.length - 1];
+    const next = new Date(Date.parse(`${last.date}T00:00:00Z`) + every * 86400000).toISOString().slice(0, 10);
+    const n = Math.max(...p.sends.map((s) => Number((s.id.match(/(\d+)$/) || [])[1] || 0))) + 1;
+    p.sends.push({
+      id: `${r.idPrefix || 'profullstack-'}${String(n).padStart(3, '0')}`,
+      date: next,
+      sent: false,
+      list: r.list || last.list,
+      ctaSet: r.ctaSet || 'default',
+      test: r.test || 'two arms, whatever the last issue left undecided',
+    });
+    changed = true;
+  }
+
+  // The plan is a schedule, not an archive: myna holds the history.
+  const keep = Number(r.keepSent) || 12;
+  const sent = p.sends.filter((s) => s.sent);
+  if (sent.length > keep) {
+    const drop = new Set(sent.slice(0, sent.length - keep).map((s) => s.id));
+    p.sends = p.sends.filter((s) => !drop.has(s.id));
+    changed = true;
+  }
+  return changed;
+}
+
+function savePlan(p) {
+  writeFileSync(PLAN, `${JSON.stringify(p, null, 2)}\n`);
 }
 
 /** The issue to prepare: --id, else the first unsent one due within --days. */
@@ -230,10 +286,12 @@ async function main() {
   mkdirSync(DRAFTS, { recursive: true });
   mkdirSync(DATA, { recursive: true });
   const p = plan();
+  const touched = [reconcile(p), rollForward(p)].some(Boolean);
+  if (touched && !has('--dry-run')) savePlan(p);
   const issue = pick(p);
   if (!issue) {
     const left = p.sends.filter((s) => !s.sent);
-    if (!left.length && !existsSync(join(DATA, 'wrapped'))) {
+    if (!left.length && !p.recurring && !existsSync(join(DATA, 'wrapped'))) {
       let numbers = '';
       try { numbers = sh('newsletter-abtest', ['--print']); } catch { numbers = '(the digest would not run)'; }
       await mail('Newsletter campaign: that was the last issue', [
