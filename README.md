@@ -139,45 +139,17 @@ installs it.
 
 ### `gh-prs-merge`
 
-Walks the same scopes and squash-merges every PR that qualifies, oldest first.
-**Dry run by default** — nothing changes until you pass `--apply`.
+Moved to [profullstack/cli-tools](https://github.com/profullstack/cli-tools#gh-prs-merge)
+on 2026-09-24, for the same reason `gh-pulse` went: two implementations of one
+name on `PATH` drift, and this one had already drifted. The TypeScript copy
+carries the fix for GitHub refusing to merge a stacked PR through the GraphQL
+mutation, and has tests around it.
 
-```sh
-gh-prs-merge --orgs profullstack,moshcoder          # report only
-gh-prs-merge --orgs profullstack,moshcoder --apply  # actually merge
-```
-
-A PR is merged only when all of these hold:
-
-- it is open
-- it is not a draft, or was successfully marked ready (see below)
-- `mergeable` is `MERGEABLE` and `mergeStateStatus` is `CLEAN`
-- at least one CI check exists, unless `--allow-no-checks` is passed
-- every check is `pass` or `skipping`
-- the head commit has not moved between the check and the merge, enforced with
-  `--match-head-commit`
-
-Merges never pass `--admin`, so branch protection and required reviews are still
-enforced by GitHub. If a merge is refused, that refusal stands.
-
-**Drafts.** Draft PRs are included by default. Under `--apply` each one is marked
-ready for review, re-read, and then judged by the rules above — so a draft with
-red CI ends up ready but unmerged, which is usually what you want. A dry run
-reports them as `WOULD-READY` and changes nothing. Pass `--no-ready-drafts` to
-ignore drafts entirely.
-
-Options:
-
-| Flag | Effect |
-| --- | --- |
-| `--orgs A,B` | search repositories owned by these organizations |
-| `--users A,B` | search repositories owned by these personal accounts |
-| `--limit N` | maximum PRs per owner, default 1000 |
-| `--apply` | actually mark drafts ready and squash-merge |
-| `--allow-no-checks` | also merge clean PRs that have no CI checks at all |
-| `--no-ready-drafts` | leave draft PRs alone |
-
-The closing summary counts `ready`, `readied`, `merged`, `skipped`, and `failed`.
+One behaviour differs, so the swap is not silent: repairs were **on** here
+unless you passed `--no-fix`, and are **off** there unless you pass `--fix`.
+An alias that relied on the old default needs `--fix` added.
+`curl -fsSL https://raw.githubusercontent.com/profullstack/cli-tools/master/install.sh | sh`
+installs it.
 
 ### `domainjson`
 
