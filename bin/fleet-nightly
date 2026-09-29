@@ -7,22 +7,31 @@
 //   fleet-nightly --day 2026-09-20  report a specific UTC day
 //   fleet-nightly --to a@b.com    someone else
 //
-// Two sources, both read through one Supabase management token:
+// Two kinds of source, every connection read-only:
 //   traffic  the CrawlProof tracker's daily rollups (tracker_event_daily_stats
-//            on the crawlproof.com project), human hits only, per UTC day
-//   accounts auth.users on every Supabase-backed property: signups by created_at,
-//            logins by last_sign_in_at (a per-user "last" stamp, so a user who
-//            came back today no longer counts for yesterday; the yesterday
-//            number is exact at send time, the day-before one is a floor)
+//            in crawlproof.com's self-hosted Postgres on dev2, CRAWLPROOF_DB_URL),
+//            human hits only, per UTC day; the tracker's site list still comes
+//            from crawlproof's API (CRAWLPROOF_TOKEN)
+//   accounts auth.users on every Supabase-backed property: the self-hosted
+//            stacks on dev2 (URLs from the dev2 fleet kit's state,
+//            ~/.local/state/dev2-fleet/<site>.json) and any project still on
+//            Supabase cloud (management API, SUPABASE_ACCESS_TOKEN). Signups by
+//            created_at, logins by last_sign_in_at (a per-user "last" stamp, so
+//            a user who came back today no longer counts for yesterday; the
+//            yesterday number is exact at send time, the day-before one a floor)
+//
+// Every source may fail on its own: a database that is gone or unreachable is
+// skipped and named in the report, and the email still goes out. Only a
+// report with no source at all is a failure.
 //
 // Secrets come from the team vault `fleet-nightly--prod` (logicsrc teams pull)
-// unless already in the environment: SUPABASE_ACCESS_TOKEN, RESEND_API_KEY,
-// CRAWLPROOF_TOKEN. Cron gets almost no environment, so PATH is fixed below
-// and every failure is mailed too: a nightly job that dies silently is worse
-// than none.
+// unless already in the environment: CRAWLPROOF_DB_URL, CRAWLPROOF_TOKEN,
+// RESEND_API_KEY, SUPABASE_ACCESS_TOKEN. Cron gets almost no environment, so
+// PATH is fixed below and every failure is mailed too: a nightly job that dies
+// silently is worse than none.
 
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -44,10 +53,10 @@ bufferoverride.com tipoffwatch.com genrewatch.com p0dcasters.com d3vices.com dis
 hqtui.com chovy.com nichedb.dev readm3.com watchnews.now nixamp.com agenticjobs.work
 nightcell7.com r4ck.dev`.split(/\s+/).filter(Boolean);
 
-const CRAWLPROOF_PROJECT = 'ywcizjsgrcmhgyplldac'; // crawlproof.com's Supabase project, where the tracker lives
 const CLICK_EVENTS = ['button_click', 'internal_click', 'outbound_click', 'download_click'];
 const AUTH_PATH = '(login|signin|sign-in|signup|sign-up|register|auth|magic|passkey|account)';
 const DATA_DIR = process.env.FLEET_NIGHTLY_DATA || join(homedir(), '.local/share/fleet-nightly');
+const DEV2_STATE = process.env.DEV2_FLEET_STATE || join(homedir(), '.local/state/dev2-fleet');
 const DEFAULT_FROM = 'Fleet nightly <pulse@profullstack.com>';
 const DEFAULT_TO = 'anthony@profullstack.com';
 const STRIP_DAYS = 7;
@@ -93,6 +102,7 @@ function parseEnv(text) {
 
 function loadSecrets() {
   const s = {
+    CRAWLPROOF_DB_URL: process.env.CRAWLPROOF_DB_URL,
     SUPABASE_ACCESS_TOKEN: process.env.SUPABASE_ACCESS_TOKEN,
     RESEND_API_KEY: process.env.RESEND_API_KEY,
     CRAWLPROOF_TOKEN: process.env.CRAWLPROOF_TOKEN,
@@ -134,7 +144,7 @@ async function getJson(url, headers) {
   return JSON.parse(text);
 }
 
-/** Run read-only SQL on a Supabase project through the management API. */
+/** Run read-only SQL on a Supabase cloud project through the management API. */
 async function sql(token, ref, query) {
   const r = await fetch(`https://api.supabase.com/v1/projects/${ref}/database/query`, {
     method: 'POST',
@@ -142,9 +152,50 @@ async function sql(token, ref, query) {
     body: JSON.stringify({ query, read_only: true }),
   });
   const text = await r.text();
+  if (r.status === 404) throw new Error(`Supabase project ${ref} is gone (${text.slice(0, 80)})`);
   if (!r.ok) throw new Error(`sql on ${ref} -> ${r.status}: ${text.slice(0, 200)}`);
   return JSON.parse(text);
 }
+
+// Node has no Postgres client and this script has no dependencies, so direct
+// connections go through Bun's built-in one: one bun process runs every job
+// and answers with one JSON array, a { rows } or { error } per job, so one
+// dead database never takes the others with it. Every session is read-only
+// before its query runs, and the check that it took is part of the job.
+const PG_RUNNER = `
+const jobs = JSON.parse(await Bun.stdin.text());
+const run = async (j) => {
+  const db = new Bun.SQL(j.url, { max: 1, connectionTimeout: 20, idleTimeout: 5 });
+  try {
+    await db.unsafe('set session characteristics as transaction read only');
+    await db.unsafe("set statement_timeout = '120s'");
+    const [ro] = await db.unsafe('show transaction_read_only');
+    if (ro.transaction_read_only !== 'on') throw new Error('session is not read-only');
+    return { rows: [...(await db.unsafe(j.query))] };
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  } finally {
+    await db.close().catch(() => {});
+  }
+};
+process.stdout.write(JSON.stringify(await Promise.all(jobs.map(run))));
+`;
+
+/** Run each { url, query } job on its own read-only connection. */
+async function pgJobs(jobs) {
+  if (!jobs.length) return [];
+  const { stdout } = await new Promise((resolve, reject) => {
+    const child = execFile('bun', ['-e', PG_RUNNER], { timeout: 300_000, maxBuffer: 64 << 20 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(`bun: ${String(stderr || err.message).trim().slice(0, 300)}`));
+      else resolve({ stdout });
+    });
+    child.stdin.end(JSON.stringify(jobs));
+  });
+  return JSON.parse(stdout);
+}
+
+// A json column arrives parsed from one client and as text from another.
+const asObject = (v) => (typeof v === 'string' ? JSON.parse(v) : v) || {};
 
 const hostOf = (url) => { try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch { return null; } };
 
@@ -160,12 +211,11 @@ async function trackerSites(crawlproofToken) {
 }
 
 /** Per project, per day, per kind: pageviews, hits, clicks, forms, auth-form submits. */
-async function trackerRows(token, ids) {
-  if (!ids.length) return [];
-  const list = ids.map((id) => `'${id}'`).join(',');
+function trackerQuery(ids) {
+  const list = ids.map((id) => `'${String(id).replace(/'/g, "''")}'`).join(',');
   const clicks = CLICK_EVENTS.map((e) => `'${e}'`).join(',');
-  return sql(token, CRAWLPROOF_PROJECT, `
-    select project_id, day::text as day, coalesce(kind, 'human') as kind,
+  return `
+    select project_id::text as project_id, day::text as day, coalesce(kind, 'human') as kind,
       coalesce(sum(count) filter (where event = 'pageview'), 0)::int as pv,
       coalesce(sum(count), 0)::int as hits,
       coalesce(sum(count) filter (where event in (${clicks})), 0)::int as clicks,
@@ -173,23 +223,10 @@ async function trackerRows(token, ids) {
       coalesce(sum(count) filter (where event = 'form_submit' and page_path ~* '${AUTH_PATH}'), 0)::int as auth_forms
     from tracker_event_daily_stats
     where project_id in (${list}) and day >= '${FIRST}' and day <= '${DAY}'
-    group by 1, 2, 3`);
+    group by 1, 2, 3`;
 }
 
-/** Which Supabase projects are properties. Names are hosts, or a host minus .com. */
-async function authProjects(token) {
-  const projects = await getJson('https://api.supabase.com/v1/projects', { Authorization: `Bearer ${token}` });
-  const out = [];
-  for (const p of projects) {
-    const name = String(p.name || '').toLowerCase();
-    const host = PROPERTIES.includes(name) ? name : PROPERTIES.includes(`${name}.com`) ? `${name}.com` : null;
-    if (host && p.status !== 'INACTIVE') out.push({ host, ref: p.id, status: p.status });
-  }
-  return out;
-}
-
-async function authStats(token, ref) {
-  const [row] = await sql(token, ref, `
+const AUTH_QUERY = () => `
     select
       (select count(*) from auth.users)::int as total,
       (select coalesce(json_object_agg(d, n), '{}'::json) from (
@@ -197,8 +234,61 @@ async function authStats(token, ref) {
         from auth.users where created_at >= '${FIRST}' group by 1) s) as signups,
       (select coalesce(json_object_agg(d, n), '{}'::json) from (
         select (last_sign_in_at at time zone 'UTC')::date::text as d, count(*)::int as n
-        from auth.users where last_sign_in_at >= '${FIRST}' group by 1) s) as logins`);
-  return { total: row.total, signups: row.signups || {}, logins: row.logins || {} };
+        from auth.users where last_sign_in_at >= '${FIRST}' group by 1) s) as logins`;
+
+const authRow = (row) => ({ total: row.total, signups: asObject(row.signups), logins: asObject(row.logins) });
+
+/**
+ * Properties on their own self-hosted Supabase stack on dev2, from the dev2
+ * fleet kit's per-site state (cli-tools dev2-site writes sb_database_url
+ * there at supabase-stack time). This is where every Supabase-cloud property
+ * went on 2026-09-25.
+ */
+export function dev2Stacks(dir = DEV2_STATE) {
+  const out = [];
+  let files = [];
+  try { files = readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return out; }
+  for (const f of files) {
+    try {
+      const st = JSON.parse(readFileSync(join(dir, f), 'utf8'));
+      const host = String(st.site || '').toLowerCase().replace(/^www\./, '');
+      if (st.sb_database_url && PROPERTIES.includes(host)) out.push({ host, url: st.sb_database_url, where: 'dev2' });
+    } catch {
+      // A half-written state file is the kit's business; skip it.
+    }
+  }
+  return out;
+}
+
+/** Which Supabase cloud projects are properties. Names are hosts, or a host minus .com. */
+async function cloudProjects(token) {
+  const projects = await getJson('https://api.supabase.com/v1/projects', { Authorization: `Bearer ${token}` });
+  const out = [];
+  for (const p of projects) {
+    const name = String(p.name || '').toLowerCase();
+    const host = PROPERTIES.includes(name) ? name : PROPERTIES.includes(`${name}.com`) ? `${name}.com` : null;
+    if (host && p.status !== 'INACTIVE') out.push({ host, ref: p.id, where: 'Supabase cloud' });
+  }
+  return out;
+}
+
+/**
+ * The account sources as they were on the last night a report was written,
+ * so a source that has since disappeared is named instead of silently turning
+ * into a row of dots.
+ */
+export function previousAuthHosts(dataDir = DATA_DIR, before = DAY) {
+  let files = [];
+  try { files = readdirSync(join(dataDir, 'days')).filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f) && f.slice(0, 10) < before).sort(); } catch { return []; }
+  for (const f of files.reverse()) {
+    try {
+      const { properties } = JSON.parse(readFileSync(join(dataDir, 'days', f), 'utf8'));
+      return properties.filter((p) => p.auth && !p.auth.error).map((p) => p.host);
+    } catch {
+      // unreadable snapshot: try the one before
+    }
+  }
+  return [];
 }
 
 async function mapLimit(items, limit, fn) {
@@ -209,6 +299,74 @@ async function mapLimit(items, limit, fn) {
   });
   await Promise.all(workers);
   return out;
+}
+
+/**
+ * Every source, each one allowed to fail on its own. What failed is returned
+ * as `problems` and printed in the report; only a report with nothing at all
+ * in it is an error.
+ */
+async function collect(secrets) {
+  const problems = [];
+
+  // Traffic: tracker ids from crawlproof's API, rollups from its Postgres on dev2.
+  let sites = new Map();
+  let rows = [];
+  let trafficError = null;
+  try {
+    if (!secrets.CRAWLPROOF_TOKEN) throw new Error('no CRAWLPROOF_TOKEN');
+    if (!secrets.CRAWLPROOF_DB_URL) throw new Error('no CRAWLPROOF_DB_URL');
+    sites = await trackerSites(secrets.CRAWLPROOF_TOKEN);
+  } catch (e) {
+    trafficError = String(e.message || e).slice(0, 200);
+  }
+
+  const stacks = dev2Stacks();
+  // crawlproof's stack predates the fleet kit, so it has no state file; its
+  // accounts live in the same database as the tracker.
+  if (secrets.CRAWLPROOF_DB_URL && !stacks.some((s) => s.host === 'crawlproof.com')) {
+    stacks.push({ host: 'crawlproof.com', url: secrets.CRAWLPROOF_DB_URL, where: 'dev2' });
+  }
+  const onDev2 = new Set(stacks.map((s) => s.host));
+  let cloud = [];
+  if (secrets.SUPABASE_ACCESS_TOKEN) {
+    try { cloud = (await cloudProjects(secrets.SUPABASE_ACCESS_TOKEN)).filter((p) => !onDev2.has(p.host)); }
+    catch (e) { problems.push(`Supabase cloud project list: ${String(e.message || e).slice(0, 160)}`); }
+  }
+
+  const jobs = [];
+  if (!trafficError && sites.size) jobs.push({ url: secrets.CRAWLPROOF_DB_URL, query: trackerQuery([...sites.values()].map((s) => s.id)) });
+  for (const s of stacks) jobs.push({ url: s.url, query: AUTH_QUERY() });
+  let answers = [];
+  try {
+    answers = await pgJobs(jobs);
+  } catch (e) {
+    answers = jobs.map(() => ({ error: String(e.message || e) }));
+  }
+  if (!trafficError && sites.size) {
+    const a = answers.shift();
+    if (a.error) trafficError = `crawlproof Postgres: ${a.error.slice(0, 200)}`;
+    else rows = a.rows;
+  }
+  if (trafficError) {
+    problems.push(`traffic skipped (${trafficError})`);
+    sites = new Map();
+  }
+
+  const auth = stacks.map((s, i) => {
+    const a = answers[i];
+    return a.error ? { host: s.host, where: s.where, error: a.error.slice(0, 120) } : { host: s.host, where: s.where, ...authRow(a.rows[0]) };
+  });
+  auth.push(...await mapLimit(cloud, 6, async (p) => {
+    try { return { host: p.host, where: p.where, ...authRow((await sql(secrets.SUPABASE_ACCESS_TOKEN, p.ref, AUTH_QUERY()))[0]) }; }
+    catch (e) { return { host: p.host, where: p.where, error: String(e.message || e).slice(0, 120) }; }
+  }));
+
+  const now = new Set(auth.map((a) => a.host));
+  const gone = previousAuthHosts().filter((h) => !now.has(h));
+  if (gone.length) problems.push(`accounts no longer readable anywhere (had a source before, none now): ${gone.join(', ')}`);
+
+  return { sites, rows, auth, problems, trafficOk: !trafficError };
 }
 
 // ---------------------------------------------------------------- assemble
@@ -234,7 +392,8 @@ export function assemble({ sites, rows, auth }) {
   for (const a of auth) {
     const p = props.get(a.host);
     if (!p) continue;
-    p.auth = a.error ? { error: a.error } : {
+    p.auth = a.error ? { error: a.error, where: a.where } : {
+      where: a.where,
       total: a.total,
       signups: Object.fromEntries(DAYS.map((d) => [d, a.signups[d] || 0])),
       logins: Object.fromEntries(DAYS.map((d) => [d, a.logins[d] || 0])),
@@ -276,8 +435,9 @@ export function summarize(props) {
   return { views, clicks, forms, signups, logins, bots, users, tracked, withAuth, authErrors, untracked, up, down, ranked, quiet };
 }
 
-export function subjectLine(s) {
-  return `Fleet nightly, ${dayLabel(DAY)}: ${n(s.views[DAY])} views (${pct(s.views[DAY], s.views[PREV]) || '±0'}), ${n(s.signups[DAY])} signups, ${n(s.logins[DAY])} logins`;
+export function subjectLine(s, meta = {}) {
+  const views = meta.trafficOk === false ? 'traffic unavailable' : `${n(s.views[DAY])} views (${pct(s.views[DAY], s.views[PREV]) || '±0'})`;
+  return `Fleet nightly, ${dayLabel(DAY)}: ${views}, ${n(s.signups[DAY])} signups, ${n(s.logins[DAY])} logins`;
 }
 
 // ---------------------------------------------------------------- html
@@ -356,7 +516,11 @@ export function renderHtml(props, s, meta) {
       `</tr>`;
   }
 
-  const untrackedNote = s.untracked.length
+  const problems = meta.problems || [];
+  const problemsNote = problems.length
+    ? `<div style="margin-top:6px;color:${DOWN}"><span style="font-weight:600">Sources skipped:</span> ${problems.map(esc).join('; ')}. The rest of the report is complete.</div>`
+    : '';
+  const untrackedNote = s.untracked.length && meta.trafficOk !== false
     ? `<div style="margin-top:6px"><span style="font-weight:600">Not instrumented:</span> ${s.untracked.map((p) => esc(p.host)).join(', ')} have no CrawlProof tracker project, so their traffic is unknown${s.untracked.some((p) => p.auth && !p.auth.error) ? '; the ones with accounts still report signups and logins' : ''}.</div>`
     : '';
   const quietNote = s.quiet.length
@@ -391,9 +555,9 @@ ${tile('Logins', s.logins[DAY], s.logins[PREV], 'users whose last sign-in was th
 ${rowsHtml}
 </table>
 
-<div style="font-size:12px;color:${MUTE};margin-top:14px">${untrackedNote}${quietNote}${authErrNote}</div>
+<div style="font-size:12px;color:${MUTE};margin-top:14px">${problemsNote}${untrackedNote}${quietNote}${authErrNote}</div>
 
-<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">Views, clicks and form submits are the CrawlProof tracker's daily rollups for hits it did not classify as a crawler; bot views are shown only in the tile. Clicks = button, internal, outbound and download clicks. Signups and logins come from Supabase Auth on the properties that use it: signups by account creation date, logins by each user's last sign-in date, so the earlier day is a floor. Each 7-day strip is shaded on that property's own scale. Generated by fleet-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">Views, clicks and form submits are the CrawlProof tracker's daily rollups for hits it did not classify as a crawler; bot views are shown only in the tile. Clicks = button, internal, outbound and download clicks. Signups and logins come from Supabase Auth on the properties that use it (their self-hosted stacks on dev2, or Supabase cloud): signups by account creation date, logins by each user's last sign-in date, so the earlier day is a floor. Each 7-day strip is shaded on that property's own scale. Generated by fleet-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
 </td></tr></table></div>`;
 }
 
@@ -422,7 +586,8 @@ export function renderText(props, s, meta) {
     out.push(`${p.host.padEnd(24)}${(t ? n(p.views[DAY]) : '·').padStart(8)}${(t ? signed(p.views[DAY] - p.views[PREV]) : '').padStart(7)}${(t ? n(p.clicks[DAY]) : '·').padStart(8)}${(t ? n(p.forms[DAY]) : '·').padStart(7)}${(a ? n(a.signups[DAY]) : '·').padStart(9)}${(a ? n(a.logins[DAY]) : '·').padStart(8)}${(a ? n(a.total) : '·').padStart(8)}`);
   }
   out.push('');
-  if (s.untracked.length) out.push(`Not instrumented (no CrawlProof project): ${s.untracked.map((p) => p.host).join(', ')}`);
+  for (const p of meta.problems || []) out.push(`Source skipped: ${p}`);
+  if (s.untracked.length && meta.trafficOk !== false) out.push(`Not instrumented (no CrawlProof project): ${s.untracked.map((p) => p.host).join(', ')}`);
   if (s.quiet.length) out.push(`Silent all week: ${s.quiet.join(', ')}`);
   if (s.authErrors.length) out.push(`Accounts unreadable: ${s.authErrors.map((p) => `${p.host} (${p.auth.error})`).join('; ')}`);
   out.push(`Generated by fleet-nightly on ${hostname()} at ${meta.generatedAt}`);
@@ -447,25 +612,17 @@ async function resend(key, body) {
 async function main() {
   const t0 = Date.now();
   const secrets = loadSecrets();
-  if (!secrets.SUPABASE_ACCESS_TOKEN) throw new Error('no SUPABASE_ACCESS_TOKEN (vault fleet-nightly--prod or the environment)');
-  if (!secrets.CRAWLPROOF_TOKEN) throw new Error('no CRAWLPROOF_TOKEN (vault, environment, or ~/.crawlproof.json)');
-
-  const sites = await trackerSites(secrets.CRAWLPROOF_TOKEN);
-  const [rows, projects] = await Promise.all([
-    trackerRows(secrets.SUPABASE_ACCESS_TOKEN, [...sites.values()].map((s) => s.id)),
-    authProjects(secrets.SUPABASE_ACCESS_TOKEN),
-  ]);
-  const auth = await mapLimit(projects, 6, async (p) => {
-    try { return { host: p.host, ...(await authStats(secrets.SUPABASE_ACCESS_TOKEN, p.ref)) }; }
-    catch (e) { return { host: p.host, error: String(e.message || e).slice(0, 120) }; }
-  });
+  const { sites, rows, auth, problems, trafficOk } = await collect(secrets);
+  if (!trafficOk && !auth.some((a) => !a.error)) {
+    throw new Error(`no source answered:\n  ${problems.join('\n  ')}${auth.length ? `\n  ${auth.map((a) => `${a.host}: ${a.error}`).join('\n  ')}` : ''}`);
+  }
 
   const props = assemble({ sites, rows, auth });
   const s = summarize(props);
-  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', day: DAY, prev: PREV };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', day: DAY, prev: PREV, problems, trafficOk };
   const html = renderHtml(props, s, meta);
   const text = renderText(props, s, meta);
-  const subject = subjectLine(s);
+  const subject = subjectLine(s, meta);
 
   const out = join(DATA_DIR, 'out');
   mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
