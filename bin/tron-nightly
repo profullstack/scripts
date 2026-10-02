@@ -1,0 +1,414 @@
+#!/usr/bin/env node
+// tron-nightly — one email a night: how many people actually installed and
+// used TronBrowser yesterday, with our own accounts and boxes taken out.
+//
+//   tron-nightly                    send the report for yesterday (UTC)
+//   tron-nightly --dry-run          build it, write it under the data dir, send nothing
+//   tron-nightly --day 2026-10-01   report a specific UTC day (installs need the
+//                                   nginx logs, which dev2 keeps for ~2 days)
+//   tron-nightly --to a@b.com       someone else (default all@profullstack.com)
+//
+// The browser sends no telemetry (no-telemetry-by-default), and its bundled
+// extensions are unpacked so they never poll /store/updates.xml either. So
+// "installs" can only be counted where people fetch the bits:
+//   curl     GET tronbrowser.dev/install.sh in dev2's nginx access log, unique
+//            client IPs that are not our own boxes (dev1, dev2, 10.x)
+//   github   release asset download_count, as a daily delta of the running total
+//            (includes `tron upgrade` on existing installs and package-manager CI)
+//   choco    Chocolatey's total download count; AUR votes + popularity
+// Accounts come from tronbrowser's own Postgres on dev2 (users, sessions, push),
+// not Supabase Auth, which is why fleet-nightly shows it with no accounts.
+// Internal accounts (ours, QA, mailinator, example.com) are counted apart.
+//
+// Every source may fail on its own and is named in the email. Secrets: only
+// RESEND_API_KEY, from the team vault fleet-nightly--prod like fleet-nightly.
+// The DB URL is the dev2 fleet kit state (~/.local/state/dev2-fleet/tronbrowser.dev.json).
+
+import { execFile, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  join(homedir(), '.bun/bin'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+  process.env.PATH || '',
+].join(':');
+
+const DATA_DIR = process.env.TRON_NIGHTLY_DATA || join(homedir(), '.local/share/tron-nightly');
+const FLEET_DAYS = join(homedir(), '.local/share/fleet-nightly/days');
+const STATE = join(process.env.DEV2_FLEET_STATE || join(homedir(), '.local/state/dev2-fleet'), 'tronbrowser.dev.json');
+const REPO = 'profullstack/tronbrowser.dev';
+const DEFAULT_FROM = 'TronBrowser nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'all@profullstack.com';
+// Our own egress: dev1 (v4 + v6), dev2, and docker/wireguard ranges.
+const OUR_IPS = (process.env.TRON_OUR_IPS || '67.205.189.229,2604:a880:400:d1:0:4:c3fe:1,23.95.228.174').split(',');
+const OURS = (ip) => OUR_IPS.includes(ip) || /^(10\.|127\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip);
+// Accounts that are us or our tests.
+const INTERNAL = /@(profullstack\.com|tronbrowser\.dev|bbs\.profullstack\.com|mailinator\.com|example\.com)$|^ettinger@gmail\.com$|^qa[.+-]|\+qa@/i;
+const STRIP_DAYS = 7;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = opt('--to') || process.env.TRON_REPORT_TO || DEFAULT_TO;
+const FROM = process.env.TRON_REPORT_FROM || DEFAULT_FROM;
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(DAY, i - STRIP_DAYS + 1));
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  const p = execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000, env: { ...process.env, ...opts.env } }, (err, out, errOut) =>
+    err ? reject(new Error(`${cmd}: ${(errOut || err.message).trim().split('\n').slice(-3).join(' ')}`)) : resolve(out));
+  if (opts.input) { p.stdin.end(opts.input); }
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+function resendKey() {
+  if (process.env.RESEND_API_KEY) return process.env.RESEND_API_KEY;
+  const dir = mkdtempSync(join(tmpdir(), 'tron-nightly-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    const k = parseEnv(readFileSync(join(dir, 'env'), 'utf8')).RESEND_API_KEY;
+    if (k) return k;
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+// ---------------------------------------------------------------- sources
+
+/** Accounts, sessions and push devices, read-only, through Bun's Postgres client. */
+async function accounts() {
+  const url = JSON.parse(readFileSync(STATE, 'utf8')).database_url;
+  const script = `
+    import { SQL } from "bun";
+    const sql = new SQL(process.env.DBURL);
+    await sql.unsafe("set session characteristics as transaction read only");
+    const [ro] = await sql.unsafe("show transaction_read_only");
+    if (ro.transaction_read_only !== "on") throw new Error("not read-only");
+    const users = await sql.unsafe(\`select u.email, u.email_verified::text v, u.created_at,
+      (select max(created_at) from sessions s where s.user_id = u.id) last_session,
+      (select json_agg(created_at) from sessions s where s.user_id = u.id) session_times
+      from users u order by u.created_at\`);
+    const [push] = await sql.unsafe(\`select (select count(*)::int from push_devices) devices,
+      (select json_agg(last_seen_at) from push_devices) seen,
+      (select count(*)::int from push_subscriptions where deleted_at is null) subs\`);
+    const [store] = await sql.unsafe(\`select (select count(*)::int from extensions where status = 'live') exts,
+      (select count(*)::int from extension_payments where status = 'paid') paid\`);
+    console.log(JSON.stringify({ users, push, store }));
+    await sql.close();`;
+  const out = await run('bun', ['-e', script], { env: { DBURL: url }, timeout: 60_000 });
+  const { users, push, store } = JSON.parse(out.trim().split('\n').pop());
+  const dayOf = (t) => (t ? new Date(t).toISOString().slice(0, 10) : null);
+  const list = users.map((u) => ({
+    email: u.email,
+    internal: INTERNAL.test(u.email),
+    verified: u.v === '1' || u.v === 'true',
+    created: dayOf(u.created_at),
+    lastSession: dayOf(u.last_session),
+    sessionDays: [...new Set((u.session_times || []).map(dayOf))],
+  }));
+  const ext = list.filter((u) => !u.internal);
+  const per = (d) => ({
+    signups: ext.filter((u) => u.created === d).length,
+    active: ext.filter((u) => u.sessionDays.includes(d)).length,
+  });
+  return {
+    total: list.length,
+    internal: list.length - ext.length,
+    external: ext.length,
+    verified: ext.filter((u) => u.verified).length,
+    everSignedIn: ext.filter((u) => u.sessionDays.length).length,
+    returned: ext.filter((u) => u.sessionDays.some((d) => d !== u.created)).length,
+    lastSignup: ext.length ? ext[ext.length - 1].created : null,
+    recent: ext.slice(-5).reverse().map((u) => ({ domain: u.email.split('@')[1], created: u.created, verified: u.verified })),
+    days: Object.fromEntries(DAYS.map((d) => [d, per(d)])),
+    pushDevices: push.devices,
+    pushActive: (push.seen || []).filter((t) => dayOf(t) === DAY).length,
+    pushSubs: push.subs,
+    extensions: store.exts,
+    paid: store.paid,
+  };
+}
+
+/** install.sh fetches for one UTC day from dev2's shared nginx log; IPs leave the box only as hashes. */
+async function curlInstalls() {
+  const [y, m, d] = DAY.split('-');
+  const mon = new Date(`${DAY}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', timeZone: 'UTC' });
+  const stamp = `${d}/${mon}/${y}`;
+  const remote = `cd /var/log/nginx && { cat access.log access.log.1 2>/dev/null; zcat access.log.*.gz 2>/dev/null; } | ` +
+    `awk -v s='[${stamp}:' '$1=="tronbrowser.dev" && index($0, s) && $0 ~ /"(GET|HEAD) \\/install\\.sh/ {print $2}' | sort | uniq -c; ` +
+    `echo "OLDEST $(ls -tr access.log.*.gz | head -1 | xargs zcat | head -1 | grep -oE '\\[[^]]+\\]')"`;
+  const out = await run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', 'dev2', 'bash', '-s'], { input: remote, timeout: 300_000 });
+  let oldest = null; const ips = [];
+  for (const line of out.split('\n')) {
+    if (line.startsWith('OLDEST ')) { oldest = line.slice(7); continue; }
+    const m = /^\s*(\d+)\s+(\S+)$/.exec(line);
+    if (m) ips.push({ ip: m[2], hits: +m[1] });
+  }
+  const outside = ips.filter((x) => !OURS(x.ip));
+  // A log that starts after the day began undercounts; say so instead of guessing.
+  // nginx stamps look like [30/Sep/2026:07:44:30 +0000]
+  const t = /\[(\d+)\/(\w+)\/(\d+):(\d+:\d+:\d+)/.exec(oldest || '');
+  const complete = !t || Date.parse(`${t[1]} ${t[2]} ${t[3]} ${t[4]} UTC`) <= Date.parse(`${DAY}T00:00:00Z`);
+  return {
+    unique: outside.length,
+    fetches: outside.reduce((a, x) => a + x.hits, 0),
+    ours: ips.length - outside.length,
+    hashes: outside.map((x) => createHash('sha256').update(`tron-nightly:${x.ip}`).digest('hex').slice(0, 16)),
+    complete, oldest,
+  };
+}
+
+/** Release download totals; the nightly number is today's total minus the last snapshot's. */
+async function github() {
+  const out = await run('gh', ['api', `repos/${REPO}/releases?per_page=100`, '--paginate', '-q',
+    '.[] | {tag: .tag_name, published: .published_at, assets: [.assets[] | {name, n: .download_count}]}']);
+  const rels = out.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const platform = (name) => /win|\.exe|\.msi/i.test(name) ? 'Windows' : /mac|darwin|\.dmg/i.test(name) ? 'macOS' : /android|\.apk/i.test(name) ? 'Android' : 'Linux';
+  const byPlatform = {};
+  let total = 0;
+  for (const r of rels) for (const a of r.assets) { total += a.n; byPlatform[platform(a.name)] = (byPlatform[platform(a.name)] || 0) + a.n; }
+  const latest = rels[0];
+  const repo = JSON.parse(await run('gh', ['api', `repos/${REPO}`, '-q', '{stars: .stargazers_count, forks: .forks_count}']));
+  return { total, byPlatform, releases: rels.length, latest: latest && { tag: latest.tag, published: latest.published?.slice(0, 10), n: latest.assets.reduce((a, x) => a + x.n, 0) }, ...repo };
+}
+
+async function packages() {
+  const res = {};
+  try {
+    const x = await (await fetch(`https://community.chocolatey.org/api/v2/Packages()?$filter=Id%20eq%20'tronbrowser'%20and%20IsLatestVersion`)).text();
+    const g = (k) => (new RegExp(`<d:${k}[^>]*>([^<]*)`).exec(x) || [])[1];
+    res.choco = { version: g('Version'), total: +g('DownloadCount') || 0, version_n: +g('VersionDownloadCount') || 0 };
+  } catch (e) { res.chocoError = e.message; }
+  try {
+    const j = await (await fetch('https://aur.archlinux.org/rpc/v5/info?arg[]=tronbrowser-bin')).json();
+    const r = j.results?.[0];
+    if (r) res.aur = { version: r.Version, votes: r.NumVotes, popularity: r.Popularity };
+  } catch (e) { res.aurError = e.message; }
+  return res;
+}
+
+/** tronbrowser.dev page views, from what fleet-nightly already wrote at 05:15. */
+function views() {
+  for (const f of [`${DAY}.json`, ...(existsSync(FLEET_DAYS) ? readdirSync(FLEET_DAYS).sort().reverse() : [])]) {
+    const p = join(FLEET_DAYS, f);
+    if (!existsSync(p)) continue;
+    const row = JSON.parse(readFileSync(p, 'utf8')).properties?.find((x) => x.host === 'tronbrowser.dev');
+    if (row?.views && DAY in row.views) return row.views;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------- history
+
+function history() {
+  const dir = join(DATA_DIR, 'days');
+  const out = {};
+  if (existsSync(dir)) for (const f of readdirSync(dir)) if (f.endsWith('.json')) {
+    try { out[f.slice(0, 10)] = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch {}
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- render
+
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6';
+const n = (v) => (v === null || v === undefined ? '·' : Number(v).toLocaleString('en-US'));
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const signed = (d) => (d > 0 ? `+${n(d)}` : d < 0 ? `-${n(-d)}` : '±0');
+
+function verdict(r) {
+  const a = r.accounts;
+  if (!a) return 'Accounts unreadable tonight.';
+  const people = a.external;
+  const back = a.returned;
+  return `${n(people)} account${people === 1 ? '' : 's'} that are not us (of ${n(a.total)}; ${n(a.internal)} are ours or QA). ` +
+    `${n(a.verified)} verified an email, ${n(back)} ever came back after signup day. ` +
+    `Last outside signup: ${a.lastSignup ? dayLabel(a.lastSignup, true) : 'never'}.`;
+}
+
+function renderHtml(r, meta) {
+  const tile = (label, cur, prev, sub) => `<td style="width:25%;background:#f4f4f2;border-radius:8px;padding:10px 12px;vertical-align:top">
+<div style="font-size:12px;color:${MUTE}">${label}</div>
+<div style="font-size:24px;font-weight:700;margin-top:2px">${n(cur)}</div>
+<div style="font-size:12px;color:${prev === null || cur === null ? MUTE : cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev === null || cur === null ? '&nbsp;' : `${signed(cur - prev)} vs ${esc(dayLabel(PREV))}`}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:4px">${sub}</div></td>`;
+
+  const max = Math.max(1, ...DAYS.map((d) => (r.series[d]?.installs || 0) + (r.series[d]?.downloads || 0)));
+  const bars = DAYS.map((d) => {
+    const s = r.series[d] || {};
+    const v = (s.installs ?? 0) + (s.downloads ?? 0);
+    const w = Math.max(v ? 2 : 0, Math.round((v / max) * 100));
+    const known = s.installs !== undefined || s.downloads !== undefined;
+    return `<tr><td style="font-size:12px;color:${d === DAY ? INK : MUTE};padding:2px 8px 2px 0;white-space:nowrap;width:90px">${esc(dayLabel(d))}</td>
+<td style="padding:2px 0"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>${w ? `<td style="width:${w}%;background:${d === DAY ? BLUE : '#9dbfee'};height:10px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` : ''}<td style="font-size:0">&nbsp;</td></tr></table></td>
+<td style="font-size:12px;text-align:right;padding-left:8px;white-space:nowrap;width:150px;color:${known ? INK : '#c9c8c2'}">${known ? `${n(s.installs)} curl · ${n(s.downloads)} gh · ${n(s.views)} views` : 'no snapshot'}</td></tr>`;
+  }).join('');
+
+  const a = r.accounts, g = r.github, c = r.curl, p = r.packages;
+  const row = (k, v) => `<tr><td style="padding:6px 0;border-bottom:1px solid ${LINE};color:${MUTE}">${k}</td><td style="padding:6px 0;border-bottom:1px solid ${LINE};text-align:right">${v}</td></tr>`;
+  const plat = g ? Object.entries(g.byPlatform).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${k} ${n(v)}`).join(' · ') : '';
+  const recent = a?.recent?.length ? a.recent.map((u) => `${esc(dayLabel(u.created))} · @${esc(u.domain)}${u.verified ? ' · verified' : ''}`).join('<br>') : 'none';
+
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">TronBrowser nightly · ${esc(dayLabel(DAY, true))}</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">UTC day · our own boxes and test accounts excluded · compared with ${esc(dayLabel(PREV))}</div>
+<div style="font-size:14px;margin-top:12px;padding:10px 12px;border-left:3px solid ${BLUE};background:#eef3fb">${esc(verdict(r))}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:14px -6px 0;border-collapse:separate"><tr>
+${tile('Curl installs', c ? c.unique : null, r.series[PREV]?.installs ?? null, c ? `unique outside IPs on install.sh${c.complete ? '' : ' · log incomplete'}${r.newInstallers !== null ? ` · ${n(r.newInstallers)} never seen before` : ''}` : 'nginx log unreadable')}
+${tile('GitHub downloads', r.series[DAY]?.downloads ?? null, r.series[PREV]?.downloads ?? null, g ? `${n(g.total)} all-time · includes upgrades` : 'GitHub unreadable')}
+${tile('New signups', a ? a.days[DAY].signups : null, a ? a.days[PREV].signups : null, a ? `${n(a.external)} outside accounts in all` : 'DB unreadable')}
+${tile('Signed in', a ? a.days[DAY].active : null, a ? a.days[PREV].active : null, a ? 'outside users with a session that day' : '')}
+</tr></table>
+
+<div style="font-size:15px;font-weight:700;margin:18px 0 6px">Last ${STRIP_DAYS} days</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${bars}</table>
+
+<div style="font-size:15px;font-weight:700;margin:20px 0 4px">Everything else</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+${g ? row('GitHub releases', `${n(g.releases)} releases · latest ${esc(g.latest?.tag || '?')} (${esc(g.latest?.published || '?')}) ${n(g.latest?.n)} downloads`) : ''}
+${g ? row('Downloads by platform, all-time', esc(plat)) : ''}
+${g ? row('Repo', `${n(g.stars)} stars · ${n(g.forks)} forks`) : ''}
+${p.choco ? row('Chocolatey', `${n(p.choco.total)} downloads all-time · ${esc(p.choco.version || '?')} ${n(p.choco.version_n)}`) : ''}
+${p.aur ? row('AUR tronbrowser-bin', `${n(p.aur.votes)} votes · popularity ${esc(p.aur.popularity)}`) : ''}
+${a ? row('Web Push devices', `${n(a.pushDevices)} registered · ${n(a.pushActive)} seen that day · ${n(a.pushSubs)} subscriptions`) : ''}
+${a ? row('Extension store', `${n(a.extensions)} live · ${n(a.paid)} paid listing`) : ''}
+${a ? row('Latest outside signups', recent) : ''}
+${row('tronbrowser.dev views', r.views ? `${n(r.views[DAY])} humans (CrawlProof)` : 'not in fleet-nightly yet')}
+</table>
+
+${meta.problems.length ? `<div style="font-size:12px;color:${DOWN};margin-top:12px"><b>Sources skipped:</b> ${meta.problems.map(esc).join('; ')}</div>` : ''}
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">TronBrowser sends no telemetry, so there is no count of running browsers. Curl installs = distinct client IPs that fetched tronbrowser.dev/install.sh that day, minus dev1/dev2/private ranges (it also runs on <code>tron upgrade</code> from the CLI, so a returning user can count again; "never seen" compares hashed IPs with every earlier night). GitHub downloads = the day's rise in release asset download counts, which includes package-manager builds and in-place upgrades. Accounts are tronbrowser's own users table; ${esc(String(INTERNAL))} are counted as ours. Generated by tron-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
+</td></tr></table></div>`;
+}
+
+function renderText(r, meta) {
+  const a = r.accounts, s = r.series[DAY] || {};
+  return [
+    `TronBrowser nightly · ${dayLabel(DAY, true)}`,
+    '',
+    verdict(r),
+    '',
+    `Curl installs (unique outside IPs): ${n(r.curl?.unique)}${r.curl && !r.curl.complete ? ' (log incomplete)' : ''}`,
+    `GitHub release downloads: ${n(s.downloads)} (all-time ${n(r.github?.total)})`,
+    `New outside signups: ${n(a?.days[DAY].signups)} · signed in: ${n(a?.days[DAY].active)}`,
+    `tronbrowser.dev views: ${n(r.views?.[DAY])}`,
+    r.packages.choco ? `Chocolatey: ${n(r.packages.choco.total)} all-time` : '',
+    r.packages.aur ? `AUR: ${n(r.packages.aur.votes)} votes, popularity ${r.packages.aur.popularity}` : '',
+    meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+function subjectLine(r) {
+  const a = r.accounts, s = r.series[DAY] || {};
+  const parts = [
+    r.curl ? `${n(r.curl.unique)} curl install${r.curl.unique === 1 ? '' : 's'}` : 'installs unknown',
+    s.downloads !== undefined ? `${n(s.downloads)} downloads` : null,
+    a ? `${n(a.days[DAY].signups)} signups` : null,
+    a ? `${n(a.external)} real users total` : null,
+  ].filter(Boolean);
+  return `TronBrowser ${dayLabel(DAY)}: ${parts.join(', ')}`;
+}
+
+// ---------------------------------------------------------------- main
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+async function main() {
+  const t0 = Date.now();
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name} (${e.message.slice(0, 160)})`); return null; } };
+  const [acc, curl, gh, pk] = await Promise.all([
+    settle('accounts', accounts), settle('nginx', curlInstalls), settle('github', github), settle('packages', packages),
+  ]);
+  if (!acc && !curl && !gh) throw new Error(`no source answered:\n  ${problems.join('\n  ')}`);
+
+  const hist = history();
+  // Downloads for DAY = this run's total minus the latest snapshot from before DAY.
+  const before = Object.keys(hist).filter((d) => d < DAY).sort().pop();
+  const downloads = gh && before && hist[before].githubTotal !== undefined ? Math.max(0, gh.total - hist[before].githubTotal) : undefined;
+  const seen = new Set(Object.entries(hist).filter(([d]) => d < DAY).flatMap(([, h]) => h.installerHashes || []));
+  const newInstallers = curl && Object.keys(hist).some((d) => d < DAY) ? curl.hashes.filter((h) => !seen.has(h)).length : null;
+  const v = views();
+
+  const snap = {
+    day: DAY,
+    installs: curl?.unique, installsComplete: curl?.complete, installerHashes: curl?.hashes,
+    githubTotal: gh?.total, downloads,
+    signups: acc?.days[DAY].signups, active: acc?.days[DAY].active, external: acc?.external,
+    views: v?.[DAY],
+  };
+  const series = {};
+  for (const d of DAYS) {
+    const h = d === DAY ? snap : hist[d];
+    if (h) series[d] = { installs: h.installs, downloads: h.downloads, views: h.views ?? v?.[d] };
+    else if (v && d in v) series[d] = { views: v[d] };
+  }
+  const r = { accounts: acc, curl, github: gh, packages: pk || {}, views: v, series, newInstallers };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', problems };
+  const html = renderHtml(r, meta), text = renderText(r, meta), subject = subjectLine(r);
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(join(DATA_DIR, 'out'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'out', 'latest.html'), html);
+  writeFileSync(join(DATA_DIR, 'out', 'latest.txt'), text);
+  writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify(snap));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(DATA_DIR, 'out', 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(key, { from: FROM, to: [TO], subject, html, text });
+  console.log(`sent ${id} to ${TO}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`tron-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = resendKey();
+      if (key) await resend(key, { from: FROM, to: [TO], subject: 'TronBrowser nightly FAILED', text: `The TronBrowser report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`tron-nightly: could not mail the failure either: ${e2.message}`); }
+  }
+  process.exit(1);
+});
