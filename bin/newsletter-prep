@@ -81,10 +81,13 @@ function plan() {
 function reconcile(p) {
   let live = [];
   try { live = JSON.parse(sh('myna', ['newsletter', '--json'])); } catch { return false; }
-  const status = new Map(live.map((n) => [n.id, n.status]));
+  // "sending" with deliveries counts: a send that went out and then stalled
+  // on the daily cap is not the next issue to draft, and treating it as one
+  // kept prep redrafting profullstack-002 every morning while 003 waited.
+  const gone = new Set(live.filter((n) => n.status === 'sent' || (n.status === 'sending' && n.deliveries?.sent > 0)).map((n) => n.id));
   let changed = false;
   for (const s of p.sends) {
-    if (!s.sent && status.get(s.id) === 'sent') { s.sent = true; changed = true; }
+    if (!s.sent && gone.has(s.id)) { s.sent = true; changed = true; }
   }
   return changed;
 }

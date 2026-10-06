@@ -1,21 +1,34 @@
 #!/usr/bin/env node
 // newsletter-abtest — one email a day while a newsletter A/B test is running.
 //
-//   newsletter-abtest              snapshot every issue, mail the digest
-//   newsletter-abtest --dry-run    build it, print it, send nothing
-//   newsletter-abtest --print      snapshot and print, no mail
-//   newsletter-abtest --prefix X   issues whose id starts with X (default profullstack-)
-//   newsletter-abtest --to a@b.com someone else
+//   newsletter-abtest                  snapshot every issue, mail the digest
+//   newsletter-abtest --dry-run        build it, print it, send nothing
+//   newsletter-abtest --print          snapshot and print, no mail
+//   newsletter-abtest --from-snapshots render the last snapshots.jsonl readings
+//                                      instead of asking myna for stats; records
+//                                      nothing. With --to it still mails.
+//   newsletter-abtest --html FILE      also write the HTML part to FILE
+//   newsletter-abtest --prefix X       issues whose id starts with X (default profullstack-)
+//   newsletter-abtest --to a@b.com     someone else
 //
 // Why a daily snapshot and not a single reading at the end: opens and clicks
 // arrive for days after a send, so the only way to tell a real winner from an
 // early lead is to watch the same numbers move. Each run appends one line per
 // issue to snapshots.jsonl and reports the change since the run before.
 //
-// The verdict is a two-proportion z test on clicks, pooled across every issue
-// of the campaign, because one issue's arms are far too small on their own:
-// at a 1% click rate you need thousands per arm to separate them. When the
-// arms are not separable the digest says so and prints the n it would take.
+// The verdict is a two-proportion z test on clicks. Each issue's own arms get
+// one, and the subject and CTA arms are also pooled across every issue,
+// because one issue's arms are usually too small on their own: at a 1% click
+// rate you need thousands per arm to separate them. When the arms are not
+// separable the digest says so. When the gap is so small that settling it
+// would take more than a quarter of weekly two-arm sends to the whole list can
+// supply, it says "not callable at this list size" rather than printing a
+// seven-digit n.
+//
+// The schedule comes from ~/.config/newsletter-abtest/plan.json, but myna is
+// the truth about what went out: an issue that has deliveries counts as sent
+// (or sending) whatever its `sent` flag says, so it is never "overdue" and its
+// next-steps block never shows once it has gone.
 //
 // Secrets: RESEND_API_KEY from the environment, else the team vault, else
 // ~/.config/logicsrc/shell.env. Cron gets almost no environment, so PATH is
@@ -42,14 +55,22 @@ const FROM = 'Newsletter A/B <anthony@profullstack.com>';
 const DATA = join(homedir(), '.local/share/newsletter-abtest');
 const SNAPSHOTS = join(DATA, 'snapshots.jsonl');
 const PLAN = join(homedir(), '.config/newsletter-abtest/plan.json');
+const OFFLINE = has('--from-snapshots');
 
 // ---------------------------------------------------------------- myna
 
 const myna = (...a) => execFileSync('myna', a, { encoding: 'utf8', timeout: 120_000, maxBuffer: 16 << 20 });
 
+/** Every non-draft issue of the campaign, as myna lists it. Offline, a myna
+ * that will not answer is not fatal: the snapshots still name the issues. */
 function issues() {
-  const all = JSON.parse(myna('newsletter', '--json'));
-  return all.filter((n) => n.id.startsWith(PREFIX) && n.status !== 'draft');
+  try {
+    const all = JSON.parse(myna('newsletter', '--json'));
+    return all.filter((n) => n.id.startsWith(PREFIX) && n.status !== 'draft');
+  } catch (e) {
+    if (OFFLINE) return [];
+    throw e;
+  }
 }
 
 function stats(id) {
@@ -84,43 +105,66 @@ function needPerArm(p1, p2) {
 }
 
 const pct = (x) => `${(x * 100).toFixed(2)}%`;
-const plus = (n) => (n > 0 ? `+${n}` : `${n}`);
+const plus = (n) => (n > 0 ? `+${n.toLocaleString()}` : `${n.toLocaleString()}`);
+const num = (n) => Number(n || 0).toLocaleString();
+const rate = (a, b) => (b ? a / b : 0);
 
 /** Sum rows into one arm. */
 function fold(rows) {
   return rows.reduce((t, r) => ({
-    sent: t.sent + r.sent, opens: t.opens + r.opens, opensTotal: t.opensTotal + r.opensTotal,
+    sent: t.sent + r.sent, opens: t.opens + r.opens, opensTotal: t.opensTotal + (r.opensTotal || 0),
     clicks: t.clicks + r.clicks, unsubscribes: t.unsubscribes + r.unsubscribes,
   }), { sent: 0, opens: 0, opensTotal: 0, clicks: 0, unsubscribes: 0 });
 }
 
-/** Group pooled rows by a key, best click rate first. */
+/** Group rows by a key (a function of the row), best click rate first. */
 function arms(rows, key) {
   const by = new Map();
   for (const r of rows) {
-    const k = r[key];
+    const k = key(r);
     if (!by.has(k)) by.set(k, []);
     by.get(k).push(r);
   }
   return [...by.entries()]
     .map(([name, rs]) => ({ name, ...fold(rs) }))
-    .map((a) => ({ ...a, ctr: a.sent ? a.clicks / a.sent : 0, openRate: a.sent ? a.opens / a.sent : 0 }))
+    .map((a) => ({ ...a, ctr: rate(a.clicks, a.sent), openRate: rate(a.opens, a.sent) }))
     .sort((x, y) => y.ctr - x.ctr);
 }
 
-/** The verdict line for a set of arms: a winner, or what it would take. */
-function verdict(list, label) {
-  if (list.length < 2) return `${label}: only one arm so far.`;
+/** The judgement on a set of arms, as data; text and HTML both phrase it.
+ * `ceiling` is the most one arm can get from a quarter of weekly sends to the
+ * list: 13 issues, two arms each, so half the list 13 times over. A gap that
+ * needs more than that is not something this list will settle. */
+function judge(list, ceiling) {
+  if (list.length < 2) return { kind: 'one', top: list[0] };
   const [top, next] = list;
   const { p } = twoProportion(top.clicks, top.sent, next.clicks, next.sent);
-  if (p < 0.05) return `${label}: ${top.name} beats ${next.name} on clicks, ${pct(top.ctr)} against ${pct(next.ctr)} (p = ${p.toFixed(3)}). Call it.`;
+  if (p < 0.05) return { kind: 'win', top, next, p };
   const need = needPerArm(top.ctr, next.ctr);
-  const short = Math.max(0, need - top.sent);
-  const more = Number.isFinite(need)
-    ? `about ${need.toLocaleString()} per arm would settle it, ${short ? `${short.toLocaleString()} more than ${top.name} has` : 'which it now has'}`
-    : 'the two are level';
-  return `${label}: ${top.name} leads at ${pct(top.ctr)} against ${pct(next.ctr)}, but that gap is noise so far (p = ${p.toFixed(2)}); ${more}.`;
+  if (!Number.isFinite(need)) return { kind: 'level', top, next, p };
+  if (need > ceiling) return { kind: 'uncallable', top, next, p, need, ceiling };
+  return { kind: 'noise', top, next, p, need, short: Math.max(0, need - Math.min(top.sent, next.sent)) };
 }
+
+/** One sentence for a judgement. */
+function verdictText(v) {
+  const { top, next } = v;
+  switch (v.kind) {
+    case 'one': return 'Only one arm so far.';
+    case 'win': return `${top.name} beats ${next.name} on clicks, ${pct(top.ctr)} against ${pct(next.ctr)} (p = ${v.p.toFixed(3)}). Significant: call it.`;
+    case 'level': return `${top.name} and ${next.name} are level at ${pct(top.ctr)}. Noise.`;
+    case 'uncallable': return `${top.name} leads ${next.name}, ${pct(top.ctr)} against ${pct(next.ctr)}, but that is noise (p = ${v.p.toFixed(2)}) and the gap is too small to be callable at this list size.`;
+    default: return `${top.name} leads ${next.name}, ${pct(top.ctr)} against ${pct(next.ctr)}, but that is noise so far (p = ${v.p.toFixed(2)}); about ${num(v.need)} per arm would settle it${v.short ? `, ${num(v.short)} more than the smaller arm has` : ', which both now have'}.`;
+  }
+}
+
+const verdictBadge = (v) => ({
+  one: ['One arm', '#52514e', '#f4f4f2'],
+  win: ['Significant', '#1a7f37', '#e6f4ea'],
+  level: ['Noise', '#52514e', '#f4f4f2'],
+  uncallable: ['Not callable', '#8a5a00', '#fdf3dc'],
+  noise: ['Noise so far', '#52514e', '#f4f4f2'],
+})[v.kind];
 
 // ---------------------------------------------------------------- the plan
 
@@ -130,96 +174,342 @@ function plan() {
   try { return JSON.parse(readFileSync(PLAN, 'utf8')); } catch { return null; }
 }
 
-function scheduleLines(p) {
+const dayDiff = (date, today) => Math.round((Date.parse(`${date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86400000);
+const shortDate = (iso) => new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+
+/** Each planned send with its real state. An issue myna has delivered is sent
+ * (or still sending), never overdue, whatever the plan's flag says. */
+function schedule(p, sections, today) {
   if (!p?.sends?.length) return [];
-  const today = new Date().toISOString().slice(0, 10);
-  const lines = [];
-  for (const s of p.sends) {
-    const days = Math.round((Date.parse(`${s.date}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86400000);
-    const when = s.sent ? 'sent' : days === 0 ? 'DUE TODAY' : days < 0 ? `${-days} days overdue` : `in ${days} days`;
-    lines.push(`  ${s.date}  ${s.id.padEnd(18)} ${when}`);
-  }
-  return lines;
+  const live = new Map(sections.map((s) => [s.id, s]));
+  return p.sends.map((s) => {
+    const sec = live.get(s.id);
+    const delivered = sec ? sec.total.sent : 0;
+    let state, label;
+    if (sec && (sec.status === 'sent' || (s.sent && sec.status !== 'sending'))) {
+      state = 'sent';
+      label = `sent ${shortDate(sec.sentAt || `${s.date}T00:00:00Z`)}, ${num(delivered)} delivered`;
+    } else if (sec && delivered > 0) {
+      state = sec.stalled ? 'stalled' : 'sending';
+      const pending = sec.pending ? `, ${num(sec.pending)} pending` : '';
+      label = sec.stalled
+        ? `sending but stalled: ${num(delivered)} delivered${pending}, none since the last reading`
+        : `sending: ${num(delivered)} delivered${pending}`;
+    } else if (s.sent) {
+      state = 'sent'; label = 'sent';
+    } else {
+      const d = dayDiff(s.date, today);
+      state = d < 0 ? 'overdue' : d === 0 ? 'due' : 'upcoming';
+      label = d === 0 ? 'due today' : d < 0 ? `${-d} day${d === -1 ? '' : 's'} overdue` : `in ${d} day${d === 1 ? '' : 's'}`;
+    }
+    return { ...s, state, label };
+  });
 }
 
-// ---------------------------------------------------------------- the report
+// ---------------------------------------------------------------- the data
 
-function build({ record = true } = {}) {
-  const list = issues();
-  const now = new Date().toISOString();
-  const previous = readSnapshots();
+function readSnapshots() {
+  if (!existsSync(SNAPSHOTS)) return [];
+  return readFileSync(SNAPSHOTS, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
+
+/** Everything the digest says, as data. Online: ask myna and append a reading.
+ * Offline: the newest reading per issue is "now", the one before it the delta. */
+function collect({ record = true } = {}) {
+  const listed = issues();
+  const meta = new Map(listed.map((n) => [n.id, n]));
+  let snaps = readSnapshots();
+  let now = new Date().toISOString();
+  const current = new Map();
+
+  if (OFFLINE) {
+    const latest = new Map();
+    for (const s of snaps) if (s.id.startsWith(PREFIX)) latest.set(s.id, s);
+    if (!latest.size) throw new Error(`No readings in ${SNAPSHOTS}`);
+    for (const [id, s] of latest) current.set(id, s);
+    now = [...latest.values()].map((s) => s.at).sort().pop();
+    snaps = snaps.filter((s) => s.at < now);
+  } else {
+    for (const n of listed) {
+      const s = stats(n.id);
+      const reading = { at: now, id: n.id, status: n.status, total: fold(s.rows), rows: s.rows };
+      current.set(n.id, reading);
+      if (record) appendFileSync(SNAPSHOTS, `${JSON.stringify(reading)}\n`);
+    }
+  }
+
   const sections = [];
-  const pooled = [];
-
-  for (const n of list) {
-    const s = stats(n.id);
-    const total = fold(s.rows);
-    const before = previous.filter((x) => x.id === n.id).pop();
+  for (const [id, cur] of current) {
+    const n = meta.get(id) || {};
+    const before = snaps.filter((x) => x.id === id).pop();
+    const total = cur.total;
     const delta = before
       ? {
+          sent: total.sent - before.total.sent,
           opens: total.opens - before.total.opens,
           clicks: total.clicks - before.total.clicks,
           unsubscribes: total.unsubscribes - before.total.unsubscribes,
           hours: Math.max(1, Math.round((Date.parse(now) - Date.parse(before.at)) / 3_600_000)),
         }
       : null;
-    if (record) appendFileSync(SNAPSHOTS, `${JSON.stringify({ at: now, id: n.id, total, rows: s.rows })}\n`);
-    pooled.push(...s.rows);
-    sections.push({ id: n.id, subject: n.subject, rows: s.rows, total, delta });
+    const status = n.status || cur.status || (total.sent ? 'sent' : 'unknown');
+    sections.push({
+      id,
+      subject: n.subject || '',
+      subjectB: n.subjectB || null,
+      status,
+      sentAt: n.sentAt || null,
+      pending: n.deliveries?.pending || 0,
+      stalled: status === 'sending' && !!delta && delta.sent === 0,
+      rows: cur.rows,
+      total,
+      delta,
+    });
   }
+  sections.sort((a, b) => a.id.localeCompare(b.id));
 
+  // The ceiling for "callable": the biggest send so far stands in for the list.
+  const listSize = Math.max(0, ...sections.map((s) => s.total.sent), ...listed.map((n) => n.deliveries?.sent || 0));
+  const ceiling = Math.round((listSize / 2) * 13);
+  const pooled = sections.flatMap((s) => s.rows);
+  const subjectName = (r) => `Subject ${r.subjectKey}`;
+  for (const s of sections) {
+    s.arms = arms(s.rows, (r) => r.variant).map((a) => {
+      const r = s.rows.find((x) => x.variant === a.name);
+      return { ...a, subjectKey: r.subjectKey, cta: r.cta };
+    }).sort((x, y) => x.name.localeCompare(y.name));
+    s.verdict = s.arms.length > 1 ? judge([...s.arms].sort((x, y) => y.ctr - x.ctr).map((a) => ({ ...a, name: `${a.name} (${a.cta})` })), ceiling) : null;
+  }
+  const bySubject = arms(pooled, subjectName);
+  const byCta = arms(pooled, (r) => r.cta);
+  const p = plan();
+  return {
+    now,
+    today: now.slice(0, 10),
+    sections,
+    listSize,
+    ceiling,
+    subjects: Object.fromEntries(sections.flatMap((s) => [[`${s.id}:A`, s.subject], [`${s.id}:B`, s.subjectB]])),
+    bySubject, subjectVerdict: judge(bySubject, ceiling),
+    byCta, ctaVerdict: judge(byCta, ceiling),
+    plan: p,
+    schedule: schedule(p, sections, now.slice(0, 10)),
+  };
+}
+
+/** The next issue that has not gone out, or null: what the commands are for. */
+function nextUp(m) {
+  return m.schedule.find((s) => s.state !== 'sent' && s.state !== 'sending' && s.state !== 'stalled') || null;
+}
+
+function commands(due) {
+  return [
+    `myna newsletter blast <draft.md> --id ${due.id} --list ${due.list ?? 'profullstack-users'} \\`,
+    `  --subject "..." --cta-set ${due.ctaSet ?? 'default'} --via resend --service "a Profullstack, Inc. product"`,
+    `# then, once the test copy looks right:`,
+    `myna newsletter blast --go ${due.id}`,
+  ];
+}
+
+/** The subject line for the mail: the newest issue's verdict, in a few words. */
+function headline(m) {
+  const latest = [...m.sections].reverse().find((s) => s.verdict) || null;
+  const date = m.today;
+  if (!latest) return `Newsletter A/B, ${date}`;
+  const v = latest.verdict;
+  const what = v.kind === 'win' ? `${v.top.name.split(' (')[0]} wins` : v.kind === 'one' ? 'one arm' : 'noise so far';
+  const stalled = m.sections.some((s) => s.stalled) ? ', a send has stalled' : '';
+  return `Newsletter A/B, ${date}: ${latest.id} ${what} (p = ${v.p?.toFixed(2) ?? '-'})${stalled}`;
+}
+
+// ---------------------------------------------------------------- text
+
+function renderText(m) {
   const lines = [];
-  lines.push(`Newsletter A/B, ${now.slice(0, 10)}`);
+  lines.push(`Newsletter A/B, ${m.today}`);
   lines.push('');
 
-  for (const sec of sections) {
+  for (const sec of m.sections) {
     const t = sec.total;
-    lines.push(`${sec.id}  ${sec.subject}`);
-    lines.push(`  ${t.sent.toLocaleString()} sent, ${t.opens} opens (${pct(t.sent ? t.opens / t.sent : 0)}), ${t.clicks} clicks (${pct(t.sent ? t.clicks / t.sent : 0)}), ${t.unsubscribes} unsubscribed`);
-    if (sec.delta) lines.push(`  in the last ${sec.delta.hours}h: ${plus(sec.delta.opens)} opens, ${plus(sec.delta.clicks)} clicks, ${plus(sec.delta.unsubscribes)} unsubscribes`);
+    lines.push(`${sec.id}  ${sec.subject}  [${sec.stalled ? 'sending, stalled' : sec.status}]`);
+    lines.push(`  ${num(t.sent)} sent, ${num(t.opens)} opens (${pct(rate(t.opens, t.sent))}), ${num(t.clicks)} clicks (${pct(rate(t.clicks, t.sent))}), ${num(t.unsubscribes)} unsubscribed`);
+    if (sec.delta) lines.push(`  in the last ${sec.delta.hours}h: ${plus(sec.delta.sent)} sent, ${plus(sec.delta.opens)} opens, ${plus(sec.delta.clicks)} clicks, ${plus(sec.delta.unsubscribes)} unsubscribes`);
     else lines.push('  first reading, so no change to show yet');
-    lines.push('');
-  }
-
-  if (pooled.length) {
-    const bySubject = arms(pooled, 'subjectKey');
-    const byCta = arms(pooled, 'cta');
-    lines.push('Pooled across every issue');
-    lines.push('');
-    lines.push('  Subject line');
-    for (const a of bySubject) lines.push(`    ${a.name}  ${a.sent.toLocaleString()} sent  ${a.opens} opens  ${a.clicks} clicks  ${pct(a.ctr)} CTR  ${a.unsubscribes} unsubs`);
-    lines.push(`    ${verdict(bySubject, 'Verdict')}`);
-    lines.push('');
-    lines.push('  Call to action');
-    for (const a of byCta) lines.push(`    ${a.name.padEnd(18)} ${a.sent.toLocaleString()} sent  ${a.opens} opens  ${a.clicks} clicks  ${pct(a.ctr)} CTR  ${a.unsubscribes} unsubs`);
-    lines.push(`    ${verdict(byCta, 'Verdict')}`);
-    lines.push('');
-  }
-
-  const p = plan();
-  const sched = scheduleLines(p);
-  if (sched.length) {
-    lines.push('This month');
-    lines.push(...sched);
-    const due = p.sends.find((s) => !s.sent);
-    if (due) {
-      lines.push('');
-      lines.push(`  ${due.id}: ${due.test ?? ''}`);
-      lines.push(`    myna newsletter blast <draft.md> --id ${due.id} --list ${due.list ?? 'profullstack-users'} \\`);
-      lines.push(`      --subject "..." --cta-set ${due.ctaSet ?? 'default'} --via resend --service "a Profullstack, Inc. product"`);
-      lines.push(`    then, once the test copy looks right:  myna newsletter blast --go ${due.id}`);
+    if (sec.verdict) {
+      for (const a of sec.arms) lines.push(`    ${a.name}  ${a.cta.padEnd(16)} ${num(a.sent).padStart(6)} sent  ${String(a.clicks).padStart(4)} clicks  ${pct(a.ctr)} CTR`);
+      lines.push(`    Verdict: ${verdictText(sec.verdict)}`);
     }
     lines.push('');
   }
 
-  lines.push(`Opens undercount: Apple Mail and Gmail hide the pixel for many readers, so clicks are the firmer number.`);
+  if (m.bySubject.length) {
+    lines.push('Pooled across every issue');
+    lines.push('');
+    lines.push('  Subject line');
+    for (const a of m.bySubject) lines.push(`    ${a.name.padEnd(18)} ${num(a.sent).padStart(6)} sent  ${String(a.opens).padStart(4)} opens  ${String(a.clicks).padStart(4)} clicks  ${pct(a.ctr)} CTR  ${a.unsubscribes} unsubs`);
+    lines.push(`    Verdict: ${verdictText(m.subjectVerdict)}`);
+    lines.push('');
+    lines.push('  Call to action');
+    for (const a of m.byCta) lines.push(`    ${a.name.padEnd(18)} ${num(a.sent).padStart(6)} sent  ${String(a.opens).padStart(4)} opens  ${String(a.clicks).padStart(4)} clicks  ${pct(a.ctr)} CTR  ${a.unsubscribes} unsubs`);
+    lines.push(`    Verdict: ${verdictText(m.ctaVerdict)}`);
+    lines.push(`  "Not callable": settling the gap would take more than ${num(m.ceiling)} per arm, a quarter of weekly two-arm sends to a ${num(m.listSize)} list.`);
+    lines.push('');
+  }
+
+  if (m.schedule.length) {
+    lines.push('This month');
+    for (const s of m.schedule) lines.push(`  ${s.date}  ${s.id.padEnd(18)} ${s.label}`);
+    const due = nextUp(m);
+    if (due) {
+      lines.push('');
+      lines.push(`  Next: ${due.id}${due.test ? `, ${due.test}` : ''}`);
+      for (const c of commands(due)) lines.push(`    ${c}`);
+    }
+    lines.push('');
+  }
+
+  lines.push('Opens undercount: Apple Mail and Gmail hide the pixel for many readers, so clicks are the firmer number.');
   lines.push(`From ${hostname()}. Stop these with: crontab -e, delete the newsletter-abtest line.`);
   return lines.join('\n');
 }
 
-function readSnapshots() {
-  if (!existsSync(SNAPSHOTS)) return [];
-  return readFileSync(SNAPSHOTS, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+// ---------------------------------------------------------------- html
+
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const INK = '#0b0b0b', MUTE = '#52514e', FAINT = '#c9c8c2', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6', PALE = '#9dbfee';
+
+const chip = (text, fg, bg) => `<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:${bg};color:${fg};font-size:11px;font-weight:600;white-space:nowrap">${esc(text)}</span>`;
+
+const STATE_CHIP = {
+  sent: ['#1a7f37', '#e6f4ea'], sending: [BLUE, '#eef3fb'], stalled: [DOWN, '#fdecea'],
+  overdue: [DOWN, '#fdecea'], due: ['#8a5a00', '#fdf3dc'], upcoming: [MUTE, '#f4f4f2'], unknown: [MUTE, '#f4f4f2'],
+};
+
+/** A delta since the last reading. Unsubscribes going up is the bad direction. */
+function deltaHtml(d, hours, badWhenUp = false) {
+  if (d === undefined) return `<span style="font-size:11px;color:${MUTE}">first reading</span>`;
+  const good = badWhenUp ? d < 0 : d > 0;
+  const color = d === 0 ? MUTE : good ? UP : DOWN;
+  return `<span style="font-size:12px;color:${color};white-space:nowrap">${plus(d)}</span> <span style="font-size:11px;color:${MUTE}">in ${hours}h</span>`;
+}
+
+function tile(label, value, sub, delta, hours, badWhenUp) {
+  return `<td style="padding:10px 12px;border:1px solid ${LINE};border-radius:8px;vertical-align:top;width:25%;background:#fff">` +
+    `<div style="font-size:11px;color:${MUTE};text-transform:uppercase;letter-spacing:.04em">${label}</div>` +
+    `<div style="font-size:24px;font-weight:600;color:${INK};line-height:1.2">${num(value)}</div>` +
+    `<div style="font-size:11px;color:${MUTE};margin-top:1px">${sub}</div>` +
+    `<div style="margin-top:2px">${deltaHtml(delta, hours, badWhenUp)}</div></td>`;
+}
+
+const th = (label, align = 'right') => `<th style="padding:6px 6px;text-align:${align};font-size:11px;color:${MUTE};font-weight:600;text-transform:uppercase;letter-spacing:.04em;border-bottom:2px solid ${LINE};white-space:nowrap">${label}</th>`;
+const td = (html, align = 'right', extra = '') => `<td style="padding:7px 6px;text-align:${align};border-bottom:1px solid ${LINE};vertical-align:middle;${extra}">${html}</td>`;
+
+/** A CTR bar on the table's own scale; the leader is solid blue. */
+function bar(ctr, max, lead) {
+  const w = Math.max(2, Math.round((ctr / Math.max(max, 1e-9)) * 100));
+  return `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;min-width:90px"><tr>` +
+    `<td style="width:${w}%;background:${lead ? BLUE : PALE};height:10px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` +
+    `<td style="font-size:12px;color:${INK};padding-left:8px;white-space:nowrap;font-weight:${lead ? 600 : 400}">${pct(ctr)}</td><td></td></tr></table>`;
+}
+
+/** The arm table: name cells, then sent / opens / clicks, then the CTR bar. */
+function armTable(list, nameCols, leader) {
+  const max = Math.max(...list.map((a) => a.ctr));
+  const head = nameCols.map(([label]) => th(label, 'left')).join('') + th('Sent') + th('Opens') + th('Clicks') + th('Unsubs') + th('Click rate', 'left');
+  const body = list.map((a) => {
+    const lead = a === leader;
+    return '<tr>' +
+      nameCols.map(([, cell], i) => td(cell(a, lead), 'left', i === 0 ? 'white-space:nowrap' : '')).join('') +
+      td(num(a.sent)) + td(`${num(a.opens)}<div style="font-size:11px;color:${MUTE}">${pct(a.openRate)}</div>`) + td(num(a.clicks), 'right', `font-weight:${lead ? 600 : 400}`) +
+      td(num(a.unsubscribes), 'right', `color:${a.unsubscribes ? INK : FAINT}`) +
+      td(bar(a.ctr, max, lead), 'left', 'width:34%') + '</tr>';
+  }).join('');
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse"><tr>${head}</tr>${body}</table>`;
+}
+
+function verdictHtml(v) {
+  const [label, fg, bg] = verdictBadge(v);
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:8px;background:${bg};border-radius:8px"><tr>` +
+    `<td style="padding:9px 12px;font-size:13px;color:${INK};line-height:1.45"><span style="font-weight:700;color:${fg};text-transform:uppercase;font-size:11px;letter-spacing:.05em">${esc(label)}</span>&nbsp; ${esc(verdictText(v))}</td></tr></table>`;
+}
+
+function renderHtml(m) {
+  const h2 = (t, sub = '') => `<div style="font-size:15px;font-weight:700;margin:24px 0 6px">${t}${sub ? ` <span style="font-size:12px;font-weight:400;color:${MUTE}">${sub}</span>` : ''}</div>`;
+
+  const issueHtml = m.sections.map((sec) => {
+    const t = sec.total, d = sec.delta || {};
+    const state = sec.stalled ? 'stalled' : sec.status === 'sending' ? 'sending' : sec.status === 'sent' ? 'sent' : 'unknown';
+    const [fg, bg] = STATE_CHIP[state];
+    const stateLabel = sec.stalled ? 'sending, stalled' : sec.status;
+    const variants = sec.arms.length;
+    let armsHtml = '';
+    if (sec.verdict) {
+      const leader = sec.arms.reduce((x, y) => (y.ctr > x.ctr ? y : x));
+      armsHtml = armTable(sec.arms, [
+        ['Arm', (a, lead) => `<span style="font-weight:${lead ? 700 : 600}">${esc(a.name)}</span>`],
+        ['Subject · CTA', (a) => `<span style="color:${MUTE}">${esc(a.subjectKey)}</span> · ${esc(a.cta)}`],
+      ], leader) + verdictHtml(sec.verdict);
+    }
+    return `<div style="margin-top:22px;padding-top:14px;border-top:1px solid ${LINE}">` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>` +
+      `<td style="vertical-align:top"><div style="font-size:16px;font-weight:700">${esc(sec.id)}</div>` +
+      `<div style="font-size:13px;color:${MUTE};margin-top:1px">${esc(sec.subject)}${sec.subjectB ? ` <span style="color:${FAINT}">/</span> ${esc(sec.subjectB)}` : ''}</div></td>` +
+      `<td style="vertical-align:top;text-align:right;white-space:nowrap;padding-left:10px">${chip(stateLabel, fg, bg)}<div style="font-size:11px;color:${MUTE};margin-top:3px">${variants} arm${variants === 1 ? '' : 's'}${sec.sentAt ? ` · ${esc(shortDate(sec.sentAt))}` : ''}</div></td>` +
+      `</tr></table>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:8px -6px 4px;border-collapse:separate"><tr>` +
+      tile('Sent', t.sent, sec.pending ? `${num(sec.pending)} pending` : 'delivered', d.sent, d.hours) +
+      tile('Opens', t.opens, `${pct(rate(t.opens, t.sent))} open rate`, d.opens, d.hours) +
+      tile('Clicks', t.clicks, `${pct(rate(t.clicks, t.sent))} click rate`, d.clicks, d.hours) +
+      tile('Unsubs', t.unsubscribes, `${pct(rate(t.unsubscribes, t.sent))} of sent`, d.unsubscribes, d.hours, true) +
+      `</tr></table>` + armsHtml + '</div>';
+  }).join('');
+
+  const subjectList = m.bySubject;
+  const pooledHtml = subjectList.length ? [
+    h2('Subject line', 'pooled across every issue'),
+    armTable(subjectList, [['Subject', (a, lead) => `<span style="font-weight:${lead ? 700 : 600}">${esc(a.name)}</span>`]], subjectList[0]),
+    verdictHtml(m.subjectVerdict),
+    h2('Call to action', 'pooled across every issue'),
+    armTable(m.byCta, [['CTA', (a, lead) => `<span style="font-weight:${lead ? 700 : 600}">${esc(a.name)}</span>`]], m.byCta[0]),
+    verdictHtml(m.ctaVerdict),
+    `<div style="font-size:11px;color:${MUTE};margin-top:6px">Not callable means settling the gap would take more than ${num(m.ceiling)} per arm: a quarter of weekly two-arm sends to a ${num(m.listSize)} list. Bars are on each table's own scale.</div>`,
+  ].join('') : '';
+
+  let schedHtml = '';
+  if (m.schedule.length) {
+    const rows = m.schedule.map((s) => {
+      const [fg, bg] = STATE_CHIP[s.state];
+      return '<tr>' + td(esc(s.date), 'left', `white-space:nowrap;color:${MUTE}`) + td(`<span style="font-weight:600">${esc(s.id)}</span>`, 'left', 'white-space:nowrap') +
+        td(`${chip(s.state === 'stalled' ? 'stalled' : s.state, fg, bg)} <span style="font-size:12px;color:${MUTE}">${esc(s.label)}</span>`, 'left') +
+        td(`<span style="font-size:12px;color:${MUTE}">${esc(s.test || '')}</span>`, 'left') + '</tr>';
+    }).join('');
+    schedHtml = h2('This month', esc(m.plan?.campaign || '')) +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse"><tr>${th('Date', 'left')}${th('Issue', 'left')}${th('Status', 'left')}${th('Test', 'left')}</tr>${rows}</table>`;
+    const due = nextUp(m);
+    if (due) {
+      schedHtml += `<div style="font-size:13px;margin:14px 0 6px"><span style="font-weight:700">Next: ${esc(due.id)}</span> <span style="color:${MUTE}">${esc(due.label)}</span></div>` +
+        `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#1d1d1b;border-radius:8px"><tr><td style="padding:12px 14px">` +
+        `<pre style="margin:0;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#f4f4f2;white-space:pre-wrap;word-break:break-word">${commands(due).map((c) => (c.startsWith('#') ? `<span style="color:#8f8e88">${esc(c)}</span>` : esc(c))).join('\n')}</pre>` +
+        `</td></tr></table>`;
+    }
+  }
+
+  const stalled = m.sections.filter((s) => s.stalled);
+  const stalledNote = stalled.length
+    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;background:#fdecea;border-radius:8px"><tr><td style="padding:9px 12px;font-size:13px;color:${INK}"><span style="font-weight:700;color:${DOWN}">Stalled send:</span> ${stalled.map((s) => `${esc(s.id)} is still "sending" with ${num(s.total.sent)} delivered and nothing new since the last reading`).join('; ')}. Check the myna daemon.</td></tr></table>`
+    : '';
+
+  const totals = fold(m.sections.flatMap((s) => s.rows));
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">Newsletter A/B · ${esc(new Date(`${m.today}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }))}</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">${m.sections.length} issue${m.sections.length === 1 ? '' : 's'} · ${num(totals.sent)} emails · ${num(totals.clicks)} clicks (${pct(rate(totals.clicks, totals.sent))}) · read at ${esc(m.now.slice(11, 16))} UTC, changes since the reading before</div>
+${stalledNote}
+${issueHtml}
+${pooledHtml}
+${schedHtml}
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">Verdicts are a two-sided two-proportion z test on clicks at p &lt; 0.05. Opens undercount: Apple Mail and Gmail hide the pixel for many readers, so clicks are the firmer number. Generated by newsletter-abtest on ${esc(hostname())}. Stop these with: crontab -e, delete the newsletter-abtest line.</div>
+</td></tr></table></div>`;
 }
 
 // ---------------------------------------------------------------- mail
@@ -246,13 +536,15 @@ function resendKey() {
   return null;
 }
 
-async function mail(subject, text) {
+const preHtml = (text) => `<pre style="font:14px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap">${esc(text)}</pre>`;
+
+async function mail(subject, text, html = preHtml(text)) {
   const key = resendKey();
   if (!key) throw new Error('No RESEND_API_KEY in the environment, the vault or shell.env');
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ from: FROM, to: [TO], subject, text, html: `<pre style="font:14px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap">${text.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c])}</pre>` }),
+    body: JSON.stringify({ from: FROM, to: [TO], subject, text, html }),
   });
   if (!r.ok) throw new Error(`resend ${r.status}: ${(await r.text()).slice(0, 300)}`);
 }
@@ -261,18 +553,25 @@ async function mail(subject, text) {
 
 async function main() {
   mkdirSync(DATA, { recursive: true });
-  let report;
+  const quiet = has('--dry-run') || has('--print');
+  // Offline renders mail only when --to says where: a re-render of old
+  // readings must never land in the real inbox by accident.
+  const send = !quiet && (!OFFLINE || has('--to'));
+  let m, text, html;
   try {
-    report = build({ record: !has('--dry-run') });
+    m = collect({ record: !has('--dry-run') && !OFFLINE });
+    text = renderText(m);
+    html = renderHtml(m);
   } catch (e) {
-    report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
-    if (!has('--dry-run') && !has('--print')) await mail('Newsletter A/B: the digest failed', report);
+    const report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
+    if (send) await mail('Newsletter A/B: the digest failed', report);
     console.error(report);
     process.exit(1);
   }
-  if (has('--dry-run') || has('--print')) { console.log(report); return; }
-  await mail(`Newsletter A/B, ${new Date().toISOString().slice(0, 10)}`, report);
-  console.log(report);
+  const htmlOut = val('--html', null);
+  if (htmlOut) writeFileSync(htmlOut, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(headline(m))}</title><body style="margin:0">${html}</body>`);
+  if (send) await mail(headline(m), text, html);
+  console.log(text);
 }
 
 main().catch((e) => { console.error(e?.stack || e); process.exit(1); });
