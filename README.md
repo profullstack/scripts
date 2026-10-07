@@ -367,3 +367,27 @@ draft pulled in a 21+ cigar post on its own, which is what `EXCLUDE_WORDS` is
 for. And it will not send to the list. The send reaches thousands of people
 and cannot be recalled, so the last step is a person reading the test copy and
 running one line, after which the myna daemon sends it at its hour.
+
+## nichedb-nightly
+
+The nightly Knowledge Influencer report for nichedb.dev: what is waiting on a
+human (claims, contributions, unanswered agent questions, payout addresses,
+money owed), then niches, contributions, agent questions, money, tiers and the
+index. HTML in the house report style, with a full text/plain part.
+
+nichedb's Postgres has no public port, so a small Bun script is piped over
+`ssh` into the running app container on dev2 and prints the numbers as one
+JSON line; everything else happens locally. Each sent report appends a reading
+to `~/.local/share/nichedb-nightly/snapshots.jsonl`, and the headline tiles
+show the change since the one before.
+
+```
+nichedb-nightly                    read, record, mail the report
+nichedb-nightly --dry-run          read and print; record nothing, send nothing
+nichedb-nightly --to a@b.com       a test send elsewhere (records nothing)
+nichedb-nightly --html FILE        also write the HTML part to FILE
+nichedb-nightly --save-json FILE   keep the numbers that were read
+nichedb-nightly --from-json FILE   render saved numbers instead of reading
+```
+
+Runs from cron at 05:05 UTC. A failure is mailed as "NicheDB nightly FAILED".

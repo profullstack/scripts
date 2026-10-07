@@ -1,65 +1,60 @@
-#!/usr/bin/env bash
-#
-# Nightly Knowledge Influencer report for nichedb.dev, by email.
-#
-# nichedb's Postgres is on Railway's private network with no public proxy, so
-# this cannot be queried from here directly. The stats script is shipped into
-# the running container over `railway ssh` and executed there with `bun`, which
-# is the only runtime in that image (there is no psql). See the
-# railway-ssh-host-key-workaround note.
-#
-# Cron gets almost no environment, so PATH is set explicitly and every tool is
-# checked before use. A silent nightly job that stopped working months ago is
-# worse than no nightly job.
-#
-#   nichedb-nightly              send the report
-#   nichedb-nightly --dry-run    print it instead of sending
-#
-set -uo pipefail
+#!/usr/bin/env node
+// nichedb-nightly — the nightly Knowledge Influencer report for nichedb.dev.
+//
+//   nichedb-nightly                    read the numbers, record them, mail the report
+//   nichedb-nightly --dry-run          read and print it; record nothing, send nothing
+//   nichedb-nightly --to a@b.com       someone else (a test send: records nothing)
+//   nichedb-nightly --html FILE        also write the HTML part to FILE
+//   nichedb-nightly --from-json FILE   render saved numbers instead of reading the
+//                                      database (pairs with --save-json, --dry-run)
+//   nichedb-nightly --save-json FILE   write the numbers that were read to FILE
+//
+// Since 2026-09-24 nichedb runs on dev2 (see the nichedb-selfhost-supabase
+// migration note). Its Postgres has no public port and the app image has no
+// psql, so a small Bun script is piped into the running app container, which
+// already carries DATABASE_URL and bun, and prints the numbers as one JSON line.
+// Everything else — deltas, text, HTML — happens here, where it can be tested
+// offline with --from-json.
+//
+// Each sending run appends one line to ~/.local/share/nichedb-nightly/
+// snapshots.jsonl, and the headline tiles show the change since the run before.
+//
+// Cron gets almost no environment, so PATH is fixed below and every failure is
+// mailed: a silent nightly job that stopped months ago is worse than none.
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, hostname } from 'node:os';
+import { join } from 'node:path';
 
-export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+].join(':');
 
-PROJECT=fb518b20-ed8b-4066-a485-85c1b627063f
-SERVICE=fd8ab4c1-3787-461a-a9a6-3564603deee3
-ENVIRONMENT=production
-TO="${NICHEDB_REPORT_TO:-anthony@profullstack.com}"
-DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+const args = process.argv.slice(2);
+const has = (f) => args.includes(f);
+const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
 
-fail() {
-  # A failure has to reach a human too, or the first thing anyone knows is that
-  # the reports quietly stopped.
-  echo "nichedb-nightly: $1" >&2
-  if [ "$DRY_RUN" = "0" ] && command -v mail >/dev/null 2>&1; then
-    printf 'The nightly nichedb report could not be produced.\n\n%s\n' "$1" |
-      mail send --to "$TO" --subject "NicheDB nightly FAILED" --file /dev/stdin >/dev/null 2>&1
-  fi
-  exit 1
-}
+const DEFAULT_TO = process.env.NICHEDB_REPORT_TO || 'anthony@profullstack.com';
+const TO = val('--to', DEFAULT_TO);
+const APP_HOST = process.env.NICHEDB_APP_HOST || 'root@dev2.profullstack.com';
+const APP_CONTAINER = process.env.NICHEDB_APP_CONTAINER || 'nichedbdev-app-1';
+const SSH_KEY = process.env.NICHEDB_SSH_KEY || join(homedir(), '.ssh/id_rsa');
+const DATA = join(homedir(), '.local/share/nichedb-nightly');
+const SNAPSHOTS = join(DATA, 'snapshots.jsonl');
+const SITE = 'https://nichedb.dev';
 
-command -v railway >/dev/null 2>&1 || fail "railway CLI is not on PATH"
-command -v mail >/dev/null 2>&1 || fail "the mail command is not on PATH"
+// ---------------------------------------------------------------- the reading
 
-WORK=$(mktemp -d) || fail "could not make a temp dir"
-trap 'rm -rf "$WORK"' EXIT
-
-cat > "$WORK/stats.mjs" <<'STATS'
+// Runs inside the app container. Numbers only: no formatting, no prose.
+const STATS = String.raw`
 import { SQL } from 'bun';
 const sql = new SQL({ url: process.env.DATABASE_URL });
-
-const money = (c) => `$${((Number(c) || 0) / 100).toFixed(2)}`;
 const one = async (q) => (await q)[0] ?? {};
-const out = [];
-const say = (s = '') => out.push(s);
+const r = { at: new Date().toISOString() };
 
-const now = new Date();
-say(`NICHEDB - KNOWLEDGE INFLUENCERS`);
-say(now.toISOString().replace('T', ' ').slice(0, 16) + ' UTC');
-say();
-
-// What is sitting on a human. This goes first because it is the only part
-// anyone can act on tonight.
-const todo = await one(sql`
+r.todo = await one(sql${'`'}
   select
     (select count(*) from niche_claims where status = 'pending')::int as claims,
     (select count(*) from contribution_events where status = 'pending')::int as contribs,
@@ -68,162 +63,364 @@ const todo = await one(sql`
     (select coalesce(sum(amount_minor),0) from revenue_allocations
        where status in ('accrued','eligible'))::bigint as owed,
     (select count(distinct influencer_id) from revenue_allocations
-       where status in ('accrued','eligible'))::int as owed_people`);
-const waiting =
-  todo.claims + todo.contribs + todo.questions + todo.addresses + (Number(todo.owed) > 0 ? 1 : 0);
+       where status in ('accrued','eligible'))::int as owed_people${'`'});
 
-say('NEEDS A HUMAN');
-if (waiting === 0) say('  nothing waiting');
-else {
-  if (todo.claims) say(`  ${todo.claims} niche claim(s) awaiting a decision   /admin/knowledge`);
-  if (todo.contribs) say(`  ${todo.contribs} contribution(s) awaiting verification   /admin/knowledge`);
-  if (todo.questions) say(`  ${todo.questions} agent question(s) unanswered`);
-  if (todo.addresses) say(`  ${todo.addresses} payout address(es) awaiting confirmation   /admin/payouts`);
-  if (Number(todo.owed) > 0)
-    say(`  ${money(todo.owed)} owed across ${todo.owed_people} person/people   /admin/payouts`);
-}
-say();
-
-const n = await one(sql`
+r.niches = await one(sql${'`'}
   select count(*)::int as total,
          count(*) filter (where status = 'operated')::int as operated,
          count(*) filter (where status = 'open')::int as open
-  from niches`);
-const members = await one(sql`
-  select count(*)::int as active,
-         count(distinct user_id)::int as people
-  from niche_members where status = 'active'`);
-say('NICHES');
-say(`  ${n.total} total: ${n.operated} operated, ${n.open} open for a claim`);
-say(`  ${members.active} active membership(s) across ${members.people} person/people`);
-say();
+  from niches${'`'});
+r.members = await one(sql${'`'}
+  select count(*)::int as active, count(distinct user_id)::int as people
+  from niche_members where status = 'active'${'`'});
 
-const c = await one(sql`
+r.contribs = await one(sql${'`'}
   select count(*) filter (where status = 'verified')::int as verified,
          count(*) filter (where status = 'pending')::int as pending,
          count(*) filter (where status = 'verified' and created_at > now() - interval '24 hours')::int as verified_24h,
          count(*) filter (where created_at > now() - interval '24 hours')::int as new_24h,
          coalesce(sum(points) filter (where status = 'verified'),0)::int as points
-  from contribution_events`);
-say('CONTRIBUTIONS');
-say(`  last 24h: ${c.new_24h} recorded, ${c.verified_24h} verified`);
-say(`  all time: ${c.verified} verified, ${c.pending} pending, ${c.points} points awarded`);
-const topTypes = await sql`
+  from contribution_events${'`'});
+r.topTypes = await sql${'`'}
   select event_type, count(*)::int as n from contribution_events
-  where status = 'verified' group by event_type order by count(*) desc limit 4`;
-if (topTypes.length) say(`  most common: ${topTypes.map((t) => `${t.event_type} x${t.n}`).join(', ')}`);
-say();
+  where status = 'verified' group by event_type order by count(*) desc limit 4${'`'};
 
-const q = await one(sql`
+r.questions = await one(sql${'`'}
   select count(*)::int as total,
          count(*) filter (where status in ('open','researching'))::int as open,
          count(*) filter (where status = 'answered')::int as answered,
          count(*) filter (where created_at > now() - interval '24 hours')::int as asked_24h,
          coalesce(extract(day from now() - min(created_at) filter (
            where status in ('open','researching'))), 0)::int as oldest_days
-  from agent_questions`);
-const answers = await one(sql`
+  from agent_questions${'`'});
+r.answers = await one(sql${'`'}
   select count(*) filter (where kind = 'answered')::int as answered,
          count(*) filter (where kind <> 'answered')::int as declined
-  from agent_answers`);
-say('AGENT QUESTIONS');
-say(`  ${q.asked_24h} asked in the last 24h; ${q.open} still open` +
-  (q.open && q.oldest_days ? ` (oldest ${q.oldest_days}d)` : ''));
-say(`  all time: ${q.total} asked, ${q.answered} settled, ${answers.declined} declined for context`);
-say();
+  from agent_answers${'`'});
 
-const rev = await one(sql`
+r.rev = await one(sql${'`'}
   select count(*)::int as events,
          coalesce(sum(gross_amount_minor),0)::bigint as gross,
          coalesce(sum(net_amount_minor),0)::bigint as net,
          coalesce(sum(gross_amount_minor) filter (
            where occurred_at > now() - interval '24 hours'),0)::bigint as gross_24h,
          coalesce(sum(net_amount_minor) filter (where niche_id is not null),0)::bigint as attributed
-  from revenue_events`);
-const alloc = await one(sql`
+  from revenue_events${'`'});
+r.alloc = await one(sql${'`'}
   select coalesce(sum(amount_minor) filter (
            where status in ('accrued','eligible') and influencer_id is not null),0)::bigint as owed,
-         coalesce(sum(amount_minor) filter (
-           where status in ('scheduled','processing')),0)::bigint as scheduled,
+         coalesce(sum(amount_minor) filter (where status in ('scheduled','processing')),0)::bigint as scheduled,
          coalesce(sum(amount_minor) filter (where status = 'paid'),0)::bigint as paid,
          coalesce(sum(amount_minor) filter (where allocation_type = 'platform'),0)::bigint as platform
-  from revenue_allocations`);
-const sales = await one(sql`
+  from revenue_allocations${'`'});
+r.sales = await one(sql${'`'}
   select count(*)::int as n,
-         coalesce(sum(total_cents),0)::int as cents,
+         coalesce(sum(total_cents),0)::bigint as cents,
          count(*) filter (where created_at > now() - interval '24 hours')::int as n_24h,
-         coalesce(sum(total_cents) filter (
-           where created_at > now() - interval '24 hours'),0)::int as cents_24h,
+         coalesce(sum(total_cents) filter (where created_at > now() - interval '24 hours'),0)::bigint as cents_24h,
          count(distinct lower(payer))::int as payers
-  from crawl_sales`);
-say('MONEY');
-say(`  crawl passes: ${sales.n_24h} sold in 24h (${money(sales.cents_24h)}), ` +
-  `${sales.n} all time (${money(sales.cents)}) from ${sales.payers} payer(s)`);
-say(`  ledger: ${rev.events} event(s), ${money(rev.gross)} gross, ${money(rev.net)} shareable`);
-say(`          ${money(rev.attributed)} attributed to a niche, ${money(alloc.platform)} to the platform`);
-say(`  owed ${money(alloc.owed)} · scheduled ${money(alloc.scheduled)} · paid ${money(alloc.paid)}`);
-say();
+  from crawl_sales${'`'});
 
-const tiers = await sql`
-  select tier_slug, count(*)::int as n from contribution_scores group by tier_slug order by count(*) desc`;
-if (tiers.length) {
-  say('TIERS');
-  say(`  ${tiers.map((t) => `${t.tier_slug} x${t.n}`).join(', ')}`);
-  say();
-}
+r.tiers = await sql${'`'}
+  select tier_slug, count(*)::int as n from contribution_scores group by tier_slug order by count(*) desc${'`'};
+r.index = await one(sql${'`'}
+  select (select count(*) from items)::bigint as items,
+         (select count(*) from items where first_seen_at > now() - interval '24 hours')::bigint as items_24h,
+         (select count(*) from collections)::int as collections${'`'});
 
-const idx = await one(sql`
-  select (select count(*) from items)::int as items,
-         (select count(*) from items where first_seen_at > now() - interval '24 hours')::int as items_24h,
-         (select count(*) from collections)::int as collections`);
-say('INDEX (what a crawl pass buys, and what attribution divides by)');
-say(`  ${idx.items.toLocaleString('en-US')} items across ${idx.collections} collections, ` +
-  `${idx.items_24h.toLocaleString('en-US')} new in 24h`);
-say();
-
-// The honest headline. If no money has ever moved, say so rather than letting
-// a page of zeros imply something is broken.
-if (sales.n === 0 && rev.events === 0) {
-  say('No crawl pass has ever been bought and the ledger is empty, so every');
-  say('money line above is zero by circumstance rather than by fault. The');
-  say('paywall is live and answering 402.');
-} else if (Number(alloc.owed) === 0 && members.active === 0) {
-  say('Money is arriving but nobody operates a niche, so all of it is the');
-  say("platform's. A claimed niche is what starts splitting it.");
-}
-
-say();
-say('https://nichedb.dev/opportunities · /admin/knowledge · /admin/payouts');
-
-console.log(out.join('\n'));
+// bigint columns arrive as BigInt or strings; every one of them fits a double.
+const plain = (v) => typeof v === 'bigint' ? Number(v)
+  : Array.isArray(v) ? v.map(plain)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)]))
+  : v;
+console.log('NICHEDB_JSON ' + JSON.stringify(plain(r)));
 await sql.end();
-STATS
+`;
 
-B64=$(base64 -w0 "$WORK/stats.mjs") || fail "could not encode the stats script"
+/** Pipe STATS into the app container and parse the one line it prints. */
+function read() {
+  const remote = `docker exec -i ${APP_CONTAINER} sh -c 'f=/tmp/nichedb-nightly-$$.mjs; cat > $f && bun $f; rc=$?; rm -f $f; exit $rc'`;
+  let out;
+  try {
+    out = execFileSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', '-i', SSH_KEY, APP_HOST, remote],
+      { input: STATS, encoding: 'utf8', timeout: 300_000, maxBuffer: 16 << 20, stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch (e) {
+    throw new Error(`the stats script failed in ${APP_CONTAINER} on ${APP_HOST}: ${String(e.stderr || e.message).trim().slice(-400)}`);
+  }
+  const line = out.split('\n').find((l) => l.startsWith('NICHEDB_JSON '));
+  if (!line) throw new Error(`no numbers came back from ${APP_CONTAINER}: ${out.slice(-400)}`);
+  return normalize(JSON.parse(line.slice('NICHEDB_JSON '.length)));
+}
 
-# Quoting a Bun template literal through ssh mangles every ${...}, so the
-# script travels base64-encoded and is decoded on the far side.
-railway ssh -p "$PROJECT" -s "$SERVICE" -e "$ENVIRONMENT" \
-  "echo $B64 | base64 -d > /tmp/nightly.mjs && bun /tmp/nightly.mjs; rm -f /tmp/nightly.mjs" \
-  > "$WORK/raw.txt" 2>"$WORK/err.txt"
+/** Every count as a Number, whatever the driver handed back. */
+function normalize(r) {
+  const fix = (v) => (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v) ? Number(v)
+    : Array.isArray(v) ? v.map(fix)
+    : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, fix(x)]))
+    : v);
+  return fix(r);
+}
 
-# Railway prints its own chatter (deprecation notices, the SSH key it used) on
-# both streams; keep only the report, which starts at its own title line.
-sed -n '/^NICHEDB - KNOWLEDGE INFLUENCERS/,$p' "$WORK/raw.txt" > "$WORK/report.txt"
+// ---------------------------------------------------------------- snapshots
 
-if [ ! -s "$WORK/report.txt" ]; then
-  fail "no report came back from the container: $(tail -c 400 "$WORK/err.txt" 2>/dev/null)"
-fi
+function lastSnapshot() {
+  if (!existsSync(SNAPSHOTS)) return null;
+  const lines = readFileSync(SNAPSHOTS, 'utf8').trim().split('\n').filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try { return JSON.parse(lines[i]); } catch {}
+  }
+  return null;
+}
 
-SUBJECT="NicheDB nightly - $(date -u +%Y-%m-%d)"
+/** The handful of numbers worth a delta, flat. */
+const headlineNumbers = (r) => ({
+  items: r.index.items, operated: r.niches.operated, salesCents: r.sales.cents, owed: r.alloc.owed,
+  members: r.members.active, verified: r.contribs.verified, questions: r.questions.total,
+});
 
-if [ "$DRY_RUN" = "1" ]; then
-  echo "--- would send to $TO as: $SUBJECT ---"
-  cat "$WORK/report.txt"
-  exit 0
-fi
+function record(r) {
+  mkdirSync(DATA, { recursive: true });
+  appendFileSync(SNAPSHOTS, JSON.stringify({ at: r.at, ...headlineNumbers(r) }) + '\n');
+}
 
-mail send --to "$TO" --subject "$SUBJECT" --file "$WORK/report.txt" >/dev/null 2>&1 ||
-  fail "the report was produced but mail send failed"
+/** Change since the last snapshot, with its age in hours; null on the first run. */
+function deltas(r, prev) {
+  if (!prev) return null;
+  const now = headlineNumbers(r);
+  const d = { hours: Math.max(1, Math.round((Date.parse(r.at) - Date.parse(prev.at)) / 3_600_000)) };
+  for (const k of Object.keys(now)) d[k] = prev[k] === undefined ? undefined : now[k] - prev[k];
+  return d;
+}
 
-echo "nichedb-nightly: sent to $TO"
+// ---------------------------------------------------------------- model
+
+const num = (n) => Number(n || 0).toLocaleString('en-US');
+const money = (c) => `$${((Number(c) || 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const signed = (n, f = num) => (n > 0 ? `+${f(n)}` : n < 0 ? `-${f(-n)}` : '±0');
+const plural = (n, one, many = `${one}s`) => `${num(n)} ${n === 1 ? one : many}`;
+const compact = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e4 ? `${(n / 1e3).toFixed(1)}K` : num(n));
+
+/** What is sitting on a human: the only part anyone can act on tonight. */
+function todoList(r) {
+  const t = r.todo, list = [];
+  if (t.claims) list.push({ text: `${plural(t.claims, 'niche claim')} awaiting a decision`, path: '/admin/knowledge' });
+  if (t.contribs) list.push({ text: `${plural(t.contribs, 'contribution')} awaiting verification`, path: '/admin/knowledge' });
+  if (t.questions) list.push({ text: `${plural(t.questions, 'agent question')} unanswered`, path: null });
+  if (t.addresses) list.push({ text: `${plural(t.addresses, 'payout address', 'payout addresses')} awaiting confirmation`, path: '/admin/payouts' });
+  if (t.owed > 0) list.push({ text: `${money(t.owed)} owed across ${plural(t.owed_people, 'person', 'people')}`, path: '/admin/payouts' });
+  return list;
+}
+
+/** The honest closing line. A page of zeros should not read as a fault. */
+function honestNote(r) {
+  if (r.sales.n === 0 && r.rev.events === 0)
+    return 'No crawl pass has ever been bought and the ledger is empty, so every money line is zero by circumstance rather than by fault. The paywall is live and answering 402.';
+  if (r.alloc.owed === 0 && r.members.active === 0)
+    return "Money is arriving but nobody operates a niche, so all of it is the platform's. A claimed niche is what starts splitting it.";
+  return null;
+}
+
+/** Sections as label/value rows, shared by the text and HTML parts. */
+function sections(r) {
+  const q = r.questions;
+  return [
+    { title: 'Niches', rows: [
+      ['Total', `${num(r.niches.total)}: ${num(r.niches.operated)} operated, ${num(r.niches.open)} open for a claim`],
+      ['Members', `${plural(r.members.active, 'active membership')} across ${plural(r.members.people, 'person', 'people')}`],
+    ] },
+    { title: 'Contributions', rows: [
+      ['Last 24h', `${num(r.contribs.new_24h)} recorded, ${num(r.contribs.verified_24h)} verified`],
+      ['All time', `${num(r.contribs.verified)} verified, ${num(r.contribs.pending)} pending, ${num(r.contribs.points)} points awarded`],
+      ...(r.topTypes.length ? [['Most common', r.topTypes.map((t) => `${t.event_type} ×${num(t.n)}`).join(', ')]] : []),
+    ] },
+    { title: 'Agent questions', rows: [
+      ['Last 24h', `${num(q.asked_24h)} asked; ${num(q.open)} still open${q.open && q.oldest_days ? ` (oldest ${q.oldest_days}d)` : ''}`],
+      ['All time', `${num(q.total)} asked, ${num(q.answered)} settled, ${num(r.answers.declined)} declined for context`],
+    ] },
+    { title: 'Money', rows: [
+      ['Crawl passes', `${num(r.sales.n_24h)} sold in 24h (${money(r.sales.cents_24h)}), ${num(r.sales.n)} all time (${money(r.sales.cents)}) from ${plural(r.sales.payers, 'payer')}`],
+      ['Ledger', `${plural(r.rev.events, 'event')}, ${money(r.rev.gross)} gross, ${money(r.rev.net)} shareable`],
+      ['Split', `${money(r.rev.attributed)} attributed to a niche, ${money(r.alloc.platform)} to the platform`],
+      ['Payouts', `owed ${money(r.alloc.owed)} · scheduled ${money(r.alloc.scheduled)} · paid ${money(r.alloc.paid)}`],
+    ] },
+    ...(r.tiers.length ? [{ title: 'Tiers', rows: [['Scores', r.tiers.map((t) => `${t.tier_slug} ×${num(t.n)}`).join(', ')]] }] : []),
+    { title: 'Index', sub: 'what a crawl pass buys, and what attribution divides by', rows: [
+      ['Items', `${num(r.index.items)} across ${plural(r.index.collections, 'collection')}`],
+      ['New in 24h', num(r.index.items_24h)],
+    ] },
+  ];
+}
+
+const LINKS = [
+  ['Opportunities', '/opportunities'],
+  ['Knowledge admin', '/admin/knowledge'],
+  ['Payouts admin', '/admin/payouts'],
+];
+
+const dateLabel = (iso) => new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+const subject = (r) => `NicheDB nightly - ${r.at.slice(0, 10)}`;
+
+// ---------------------------------------------------------------- text
+
+/** Word-wrap prose for the plain part, which most clients show unreflowed. */
+const wrap = (s, w = 74) => s.split(' ').reduce((lines, word) => {
+  const last = lines[lines.length - 1];
+  if (last && (last + ' ' + word).length <= w) lines[lines.length - 1] = `${last} ${word}`;
+  else lines.push(word);
+  return lines;
+}, []).join('\n');
+
+export function renderText(r, d) {
+  const out = [];
+  const say = (s = '') => out.push(s);
+  const since = (k, f = num) => (d && d[k] !== undefined ? `  (${signed(d[k], f)} in ${d.hours}h)` : '');
+  say('NICHEDB - KNOWLEDGE INFLUENCERS');
+  say(`${r.at.replace('T', ' ').slice(0, 16)} UTC`);
+  say();
+  say(`  Items indexed     ${num(r.index.items)}  (+${num(r.index.items_24h)} in 24h)`);
+  say(`  Niches operated   ${num(r.niches.operated)} of ${num(r.niches.total)}${since('operated')}`);
+  say(`  Crawl passes      ${money(r.sales.cents)} all time${since('salesCents', money)}`);
+  say(`  Owed to people    ${money(r.alloc.owed)}${since('owed', money)}`);
+  say();
+  const todo = todoList(r);
+  say('NEEDS A HUMAN');
+  if (!todo.length) say('  nothing waiting');
+  for (const t of todo) say(`  ${t.text}${t.path ? `   ${SITE}${t.path}` : ''}`);
+  say();
+  for (const s of sections(r)) {
+    say(`${s.title.toUpperCase()}${s.sub ? ` (${s.sub})` : ''}`);
+    const w = Math.max(...s.rows.map(([k]) => k.length));
+    for (const [k, v] of s.rows) say(`  ${k.padEnd(w)}  ${v}`);
+    say();
+  }
+  const note = honestNote(r);
+  if (note) { say(wrap(note)); say(); }
+  for (const [label, path] of LINKS) say(`${label}: ${SITE}${path}`);
+  return out.join('\n');
+}
+
+// ---------------------------------------------------------------- html
+
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6';
+
+function deltaHtml(v, hours, f = num) {
+  if (v === undefined) return `<span style="font-size:11px;color:${MUTE}">first reading</span>`;
+  const color = v > 0 ? UP : v < 0 ? DOWN : MUTE;
+  return `<span style="font-size:12px;color:${color};white-space:nowrap">${signed(v, f)}</span> <span style="font-size:11px;color:${MUTE}">in ${hours}h</span>`;
+}
+
+function tile(label, value, sub, delta) {
+  return `<td style="padding:10px 12px;border:1px solid ${LINE};border-radius:8px;vertical-align:top;width:25%;background:#fff">` +
+    `<div style="font-size:11px;color:${MUTE};text-transform:uppercase;letter-spacing:.04em">${label}</div>` +
+    `<div style="font-size:24px;font-weight:600;color:${INK};line-height:1.2;white-space:nowrap">${value}</div>` +
+    `<div style="font-size:11px;color:${MUTE};margin-top:1px">${sub}</div>` +
+    `<div style="margin-top:2px">${delta}</div></td>`;
+}
+
+const button = (label, href, primary = false) =>
+  `<a href="${esc(href)}" style="display:inline-block;margin:0 6px 6px 0;padding:8px 14px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none;` +
+  (primary ? `background:${BLUE};color:#fff;border:1px solid ${BLUE}` : `background:#fff;color:${INK};border:1px solid ${LINE}`) + `">${esc(label)}</a>`;
+
+function card(s) {
+  const rows = s.rows.map(([k, v]) =>
+    `<tr><td style="padding:6px 12px 6px 0;font-size:12px;color:${MUTE};white-space:nowrap;vertical-align:top;width:110px;border-top:1px solid ${LINE}">${esc(k)}</td>` +
+    `<td style="padding:6px 0;font-size:13px;color:${INK};border-top:1px solid ${LINE}">${esc(v)}</td></tr>`).join('');
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;background:#fff;border:1px solid ${LINE};border-radius:8px"><tr><td style="padding:12px 14px">` +
+    `<div style="font-size:11px;font-weight:700;color:${MUTE};text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">${esc(s.title)}${s.sub ? ` <span style="font-weight:400;text-transform:none;letter-spacing:0">· ${esc(s.sub)}</span>` : ''}</div>` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${rows}</table></td></tr></table>`;
+}
+
+function callout(todo) {
+  if (!todo.length) {
+    return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:14px;background:#e6f4ea;border-radius:8px"><tr>` +
+      `<td style="padding:10px 14px;font-size:13px;color:${INK}"><span style="font-weight:700;color:${UP};text-transform:uppercase;font-size:11px;letter-spacing:.05em">Needs a human</span>&nbsp; Nothing waiting.</td></tr></table>`;
+  }
+  const items = todo.map((t) => `<tr><td style="padding:5px 0;font-size:13px;color:${INK}">${esc(t.text)}</td>` +
+    `<td style="padding:5px 0 5px 10px;text-align:right;white-space:nowrap">${t.path ? `<a href="${esc(SITE + t.path)}" style="font-size:12px;font-weight:600;color:${DOWN};text-decoration:none">Open ${esc(t.path)} →</a>` : ''}</td></tr>`).join('');
+  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:14px;background:#fdecea;border-left:4px solid ${DOWN};border-radius:8px"><tr><td style="padding:10px 14px">` +
+    `<div style="font-weight:700;color:${DOWN};text-transform:uppercase;font-size:11px;letter-spacing:.05em;margin-bottom:2px">Needs a human · ${todo.length}</div>` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0">${items}</table></td></tr></table>`;
+}
+
+export function renderHtml(r, d) {
+  const dl = (k, f) => deltaHtml(d ? d[k] : undefined, d?.hours, f);
+  const note = honestNote(r);
+  const tiles =
+    tile('Items indexed', compact(r.index.items), `${num(r.index.items)} in ${plural(r.index.collections, 'collection')}`,
+      `<span style="font-size:12px;color:${r.index.items_24h ? UP : MUTE}">+${num(r.index.items_24h)}</span> <span style="font-size:11px;color:${MUTE}">new in 24h</span>`) +
+    tile('Niches operated', `${num(r.niches.operated)}<span style="font-size:14px;color:${MUTE};font-weight:400"> / ${num(r.niches.total)}</span>`, `${num(r.niches.open)} open for a claim`, dl('operated')) +
+    tile('Crawl passes', money(r.sales.cents), `${plural(r.sales.n, 'sale')} · ${money(r.sales.cents_24h)} in 24h`, dl('salesCents', money)) +
+    tile('Owed to people', money(r.alloc.owed), `${money(r.alloc.paid)} paid all time`, dl('owed', money));
+
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">NicheDB · Knowledge Influencers</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">${esc(dateLabel(r.at))} · read at ${esc(r.at.slice(11, 16))} UTC${d ? `, changes since the reading ${d.hours}h before` : ''}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:12px -6px 0;border-collapse:separate"><tr>${tiles}</tr></table>
+${callout(todoList(r))}
+${sections(r).map(card).join('\n')}
+${note ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;background:#eef3fb;border-radius:8px"><tr><td style="padding:10px 14px;font-size:13px;color:${INK};line-height:1.45">${esc(note)}</td></tr></table>` : ''}
+<div style="margin-top:16px">${LINKS.map(([label, path], i) => button(label, SITE + path, i === 0)).join('')}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:16px;border-top:1px solid ${LINE};padding-top:8px">Read from the nichedb database in ${esc(APP_CONTAINER)} on dev2. "In 24h" is the database's own rolling window; tile deltas compare against the previous nightly reading. Generated by nichedb-nightly on ${esc(hostname())}. Stop these with: crontab -e, delete the nichedb-nightly line.</div>
+</td></tr></table></div>`;
+}
+
+// ---------------------------------------------------------------- mail
+
+/** Through the same `mail` CLI as before, so the sender does not change. */
+function mail(subj, text, html) {
+  const dir = join(DATA, 'outbox');
+  mkdirSync(dir, { recursive: true });
+  const t = join(dir, `${process.pid}.txt`), h = join(dir, `${process.pid}.html`);
+  writeFileSync(t, text);
+  const a = ['send', '--to', TO, '--subject', subj, '--file', t];
+  if (html) { writeFileSync(h, html); a.push('--html', h); }
+  try {
+    execFileSync('mail', a, { stdio: ['ignore', 'ignore', 'pipe'], timeout: 120_000 });
+  } finally {
+    for (const f of [t, h]) rmSync(f, { force: true });
+  }
+}
+
+// ---------------------------------------------------------------- main
+
+function main() {
+  const dry = has('--dry-run');
+  const testSend = TO !== DEFAULT_TO;
+  const fromJson = val('--from-json', null);
+  let r, d, text, html;
+  try {
+    r = fromJson ? normalize(JSON.parse(readFileSync(fromJson, 'utf8'))) : read();
+    const saveJson = val('--save-json', null);
+    if (saveJson) writeFileSync(saveJson, JSON.stringify(r, null, 2));
+    d = deltas(r, lastSnapshot());
+    text = renderText(r, d);
+    html = renderHtml(r, d);
+  } catch (e) {
+    const report = `The nightly nichedb report could not be produced on ${hostname()}.\n\n${e?.message || e}`;
+    console.error(`nichedb-nightly: ${e?.message || e}`);
+    if (!dry) try { mail('NicheDB nightly FAILED', report); } catch {}
+    process.exit(1);
+  }
+  const htmlOut = val('--html', null);
+  if (htmlOut) writeFileSync(htmlOut, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(subject(r))}</title><body style="margin:0">${html}</body>`);
+  if (dry) {
+    console.log(`--- would send to ${TO} as: ${subject(r)} ---`);
+    console.log(text);
+    return;
+  }
+  try {
+    mail(subject(r), text, html);
+  } catch (e) {
+    console.error(`nichedb-nightly: the report was produced but mail send failed: ${String(e.stderr || e.message).trim()}`);
+    try { mail('NicheDB nightly FAILED', 'The report was produced but mail send failed.'); } catch {}
+    process.exit(1);
+  }
+  // A test send to someone else must not move tomorrow's deltas, and neither
+  // must a re-render of saved numbers.
+  if (!testSend && !fromJson) record(r);
+  console.log(`nichedb-nightly: sent to ${TO}`);
+}
+
+main();
