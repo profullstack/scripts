@@ -5,7 +5,8 @@
 //   fleet-nightly                 send the report for yesterday (UTC)
 //   fleet-nightly --dry-run       build it, write it under the data dir, send nothing
 //   fleet-nightly --day 2026-09-20  report a specific UTC day
-//   fleet-nightly --to a@b.com    someone else
+//   fleet-nightly --to a@b.com    someone else (comma-separate several; default
+//                                 anthony@ and preshy@profullstack.com)
 //
 // Two kinds of source, every connection read-only:
 //   traffic  the CrawlProof tracker's daily rollups (tracker_event_daily_stats
@@ -59,7 +60,7 @@ const AUTH_PATH = '(login|signin|sign-in|signup|sign-up|register|auth|magic|pass
 const DATA_DIR = process.env.FLEET_NIGHTLY_DATA || join(homedir(), '.local/share/fleet-nightly');
 const DEV2_STATE = process.env.DEV2_FLEET_STATE || join(homedir(), '.local/state/dev2-fleet');
 const DEFAULT_FROM = 'Fleet nightly <pulse@profullstack.com>';
-const DEFAULT_TO = 'anthony@profullstack.com';
+const DEFAULT_TO = 'anthony@profullstack.com,preshy@profullstack.com';
 const STRIP_DAYS = 7;
 
 // ---------------------------------------------------------------- args
@@ -68,7 +69,7 @@ const args = process.argv.slice(2);
 const flag = (name) => args.includes(name);
 const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const DRY = flag('--dry-run');
-const TO = opt('--to') || process.env.FLEET_REPORT_TO || DEFAULT_TO;
+const TO = (opt('--to') || process.env.FLEET_REPORT_TO || DEFAULT_TO).split(',').map((s) => s.trim()).filter(Boolean);
 const FROM = process.env.FLEET_REPORT_FROM || DEFAULT_FROM;
 
 // ---------------------------------------------------------------- dates
@@ -639,8 +640,8 @@ async function main() {
     return;
   }
   if (!secrets.RESEND_API_KEY) throw new Error('no RESEND_API_KEY to send with');
-  const id = await resend(secrets.RESEND_API_KEY, { from: FROM, to: [TO], subject, html, text });
-  console.log(`sent ${id} to ${TO}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+  const id = await resend(secrets.RESEND_API_KEY, { from: FROM, to: TO, subject, html, text });
+  console.log(`sent ${id} to ${TO.join(', ')}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
 }
 
 main().catch(async (e) => {
@@ -649,7 +650,7 @@ main().catch(async (e) => {
   if (!DRY) {
     try {
       const key = process.env.RESEND_API_KEY || loadSecrets().RESEND_API_KEY;
-      if (key) await resend(key, { from: FROM, to: [TO], subject: 'Fleet nightly FAILED', text: `The nightly fleet report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+      if (key) await resend(key, { from: FROM, to: TO, subject: 'Fleet nightly FAILED', text: `The nightly fleet report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
     } catch (e2) { console.error(`fleet-nightly: could not mail the failure either: ${e2.message}`); }
   }
   process.exit(1);

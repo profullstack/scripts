@@ -3,7 +3,8 @@
 //
 //   nichedb-nightly                    read the numbers, record them, mail the report
 //   nichedb-nightly --dry-run          read and print it; record nothing, send nothing
-//   nichedb-nightly --to a@b.com       someone else (a test send: records nothing)
+//   nichedb-nightly --to a@b.com       someone else (a test send: records nothing;
+//                                      comma-separate several, as `mail send` takes)
 //   nichedb-nightly --html FILE        also write the HTML part to FILE
 //   nichedb-nightly --from-json FILE   render saved numbers instead of reading the
 //                                      database (pairs with --save-json, --dry-run)
@@ -36,7 +37,7 @@ const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
 const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
 
-const DEFAULT_TO = process.env.NICHEDB_REPORT_TO || 'anthony@profullstack.com';
+const DEFAULT_TO = process.env.NICHEDB_REPORT_TO || 'anthony@profullstack.com,preshy@profullstack.com';
 const TO = val('--to', DEFAULT_TO);
 const APP_HOST = process.env.NICHEDB_APP_HOST || 'root@dev2.profullstack.com';
 const APP_CONTAINER = process.env.NICHEDB_APP_CONTAINER || 'nichedbdev-app-1';
