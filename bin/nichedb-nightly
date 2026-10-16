@@ -129,6 +129,33 @@ r.index = await one(sql${'`'}
          (select count(*) from items where first_seen_at > now() - interval '24 hours')::bigint as items_24h,
          (select count(*) from collections)::int as collections${'`'});
 
+// Demand that exists before anyone pays. api_usage is the API rate limiter's
+// hourly counter (bucket ip:<addr> or key:<id>, kept 7 days), so it is every
+// /api request, crawlers included. Private addresses are our own proxies and
+// services, counted apart so they do not pass for visitors.
+r.traffic = await one(sql${'`'}
+  with u as (
+    select bucket, hour, count,
+           bucket like 'key:%' as keyed,
+           bucket ~ '^ip:(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' as internal
+    from api_usage where hour >= now() - interval '7 days')
+  select coalesce(sum(count) filter (where hour >= now() - interval '24 hours' and not internal),0)::bigint as reqs_24h,
+         count(distinct bucket) filter (where hour >= now() - interval '24 hours' and not internal and not keyed)::int as ips_24h,
+         count(distinct bucket) filter (where hour >= now() - interval '24 hours' and keyed)::int as keys_24h,
+         coalesce(sum(count) filter (where hour >= now() - interval '24 hours' and keyed),0)::bigint as keyed_reqs_24h,
+         coalesce(sum(count) filter (where hour >= now() - interval '24 hours' and internal),0)::bigint as internal_24h,
+         coalesce(sum(count) filter (where not internal),0)::bigint as reqs_7d,
+         greatest(1, ceil(extract(epoch from now() - min(hour)) / 86400))::int as days
+  from u${'`'});
+r.people = await one(sql${'`'}
+  select (select count(*) from users)::int as users,
+         (select count(*) from users where created_at > now() - interval '24 hours')::int as new_24h,
+         (select count(*) from users where last_seen_at > now() - interval '24 hours')::int as seen_24h,
+         (select count(*) from login_tokens where created_at > now() - interval '24 hours')::int as logins_24h,
+         (select count(*) from login_tokens where created_at > now() - interval '24 hours' and consumed_at is not null)::int as logins_used_24h,
+         (select count(*) from api_keys)::int as api_keys,
+         (select count(*) from deliveries where sent_at > now() - interval '24 hours')::int as alerts_24h${'`'});
+
 // bigint columns arrive as BigInt or strings; every one of them fits a double.
 const plain = (v) => typeof v === 'bigint' ? Number(v)
   : Array.isArray(v) ? v.map(plain)
@@ -144,7 +171,7 @@ function read() {
   let out;
   try {
     out = execFileSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30', '-i', SSH_KEY, APP_HOST, remote],
-      { input: STATS, encoding: 'utf8', timeout: 300_000, maxBuffer: 16 << 20, stdio: ['pipe', 'pipe', 'pipe'] });
+      { input: STATS, encoding: 'utf8', timeout: 600_000, maxBuffer: 16 << 20, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (e) {
     throw new Error(`the stats script failed in ${APP_CONTAINER} on ${APP_HOST}: ${String(e.stderr || e.message).trim().slice(-400)}`);
   }
@@ -215,7 +242,8 @@ function todoList(r) {
 /** The honest closing line. A page of zeros should not read as a fault. */
 function honestNote(r) {
   if (r.sales.n === 0 && r.rev.events === 0)
-    return 'No crawl pass has ever been bought and the ledger is empty, so every money line is zero by circumstance rather than by fault. The paywall is live and answering 402.';
+    return 'No crawl pass has ever been bought and the ledger is empty, so every money line is zero by circumstance rather than by fault. The paywall is live and answering 402.' +
+      (r.traffic?.reqs_24h ? ` The traffic is real: ${num(r.traffic.reqs_24h)} API requests from ${num(r.traffic.ips_24h)} addresses in 24h, mostly crawlers, and none of it paid.` : '');
   if (r.alloc.owed === 0 && r.members.active === 0)
     return "Money is arriving but nobody operates a niche, so all of it is the platform's. A claimed niche is what starts splitting it.";
   return null;
@@ -225,6 +253,13 @@ function honestNote(r) {
 function sections(r) {
   const q = r.questions;
   return [
+    ...(r.traffic ? [{ title: 'Traffic', sub: 'demand before money: API requests and accounts', rows: [
+      ['API, 24h', `${num(r.traffic.reqs_24h)} requests from ${plural(r.traffic.ips_24h, 'address', 'addresses')}; ${plural(r.traffic.keys_24h, 'API key')} used (${num(r.traffic.keyed_reqs_24h)} requests)`],
+      ['API, 7d', `${num(r.traffic.reqs_7d)} requests, ${num(Math.round(r.traffic.reqs_7d / Math.max(1, Math.min(7, r.traffic.days))))} a day on average`],
+      ['Internal', `${num(r.traffic.internal_24h)} requests from our own proxies and services (not counted above)`],
+      ['Accounts', `${num(r.people.users)} total, ${num(r.people.new_24h)} new and ${num(r.people.seen_24h)} seen in 24h; ${plural(r.people.logins_24h, 'sign-in link')} sent, ${num(r.people.logins_used_24h)} used; ${plural(r.people.api_keys, 'API key')} issued`],
+      ['Alerts', `${plural(r.people.alerts_24h, 'feed alert')} delivered in 24h`],
+    ] }] : []),
     { title: 'Niches', rows: [
       ['Total', `${num(r.niches.total)}: ${num(r.niches.operated)} operated, ${num(r.niches.open)} open for a claim`],
       ['Members', `${plural(r.members.active, 'active membership')} across ${plural(r.members.people, 'person', 'people')}`],
