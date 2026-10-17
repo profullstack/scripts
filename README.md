@@ -258,12 +258,17 @@ alert "fleet-db-backup nightly failed"
 alert --severity critical "coinpay webhooks are down"    # always rings
 alert --key qc-sweep --every 6h "riotcoder-qc sweep is erroring"
 alert --clear qc-sweep                                    # recovered
+alert --check                                             # is the key accepted?
 ```
 
 smshub sends the same text once per 10 minutes; `--key`/`--every` (default:
 the message, 6h) keeps a job that fails every minute to one alert per window.
 If smshub cannot be reached it emails `ALERT_EMAIL` (set in
 `~/.config/alert/env`) instead. Log: `~/.local/state/alert/alert.log`.
+If smshub rejects the key (401/403) the email subject says "smshub alert key
+REJECTED", names where the key came from and how to replace it; every real alert
+still gets its own email. `alert --check` (daily cron) asks smshub about the key
+without alerting anyone and sends that email once per 6h while it is rejected.
 
 ### `anthropic-credit-check`
 
