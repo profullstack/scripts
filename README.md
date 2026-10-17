@@ -246,6 +246,31 @@ command never stops to authenticate. Scoped to `-u ssh` because a full day is
 Counts `Accepted` only. Failed and half-finished attempts are thousands a day on
 a public box and answer a different question.
 
+### `alert`
+
+Tells Anthony something broke: a text, or a phone call that reads it aloud
+while no number can text yet, through smshub.dev alerts
+(`POST /api/v1/alerts`, Anthony's account, key `SMSHUB_ALERT_API_KEY` in vault
+`smshub--prod`). Cron jobs call it on real failures only.
+
+```sh
+alert "fleet-db-backup nightly failed"
+alert --severity critical "coinpay webhooks are down"    # always rings
+alert --key qc-sweep --every 6h "riotcoder-qc sweep is erroring"
+alert --clear qc-sweep                                    # recovered
+```
+
+smshub sends the same text once per 10 minutes; `--key`/`--every` (default:
+the message, 6h) keeps a job that fails every minute to one alert per window.
+If smshub cannot be reached it emails `ALERT_EMAIL` (set in
+`~/.config/alert/env`) instead. Log: `~/.local/state/alert/alert.log`.
+
+### `anthropic-credit-check`
+
+Asks the fleet's shared Anthropic key (vault `profullstack-sharable-keys--prod`)
+for one token. Out of credits, over a usage limit or refused: `alert`, at most
+once a day. Working again: clears it. Hourly from cron; `--dry-run` only prints.
+
 ### `scripts-upgrade`
 
 Moves this box to the newest release of this repo. See [Upgrading](#upgrading).

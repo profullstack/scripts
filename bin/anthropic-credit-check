@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""anthropic-credit-check: is the fleet's shared Anthropic key still able to answer?
+
+One key (vault profullstack-sharable-keys--prod, ANTHROPIC_API_KEY) is shared by
+about 14 production apps, and each of them falls back silently when it stops
+working. This asks it for one token. When the answer is "credit balance is too
+low", a usage limit or an invalid key, it runs `alert` (at most once a day);
+when it works again it clears that, so the next outage alerts at once.
+
+  anthropic-credit-check            check, alert on failure
+  anthropic-credit-check --dry-run  check and print, never alert
+
+Exit 0 when the key works, 1 when it does not, 2 when the check itself could
+not run (vault or network); only a definite answer from Anthropic alerts.
+Cron: hourly. Log: ~/.local/state/alert/anthropic-credit.log
+"""
+import csv, json, os, subprocess, sys, tempfile, urllib.error, urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+STATE = f"{HOME}/.local/state/alert"
+KEY_NAME = "anthropic-credit"
+MODEL = "claude-haiku-5-5"
+DRY = "--dry-run" in sys.argv
+os.environ["PATH"] = f"{HOME}/.local/bin:{HOME}/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+os.makedirs(STATE, exist_ok=True)
+
+
+def log(msg):
+    line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
+    with open(f"{STATE}/anthropic-credit.log", "a") as f:
+        f.write(line + "\n")
+    if DRY or sys.stdout.isatty():
+        print(line)
+
+
+def vault_key():
+    with tempfile.TemporaryDirectory(dir=STATE) as tmp:
+        out = f"{tmp}/v.csv"
+        subprocess.run(["logicsrc", "teams", "export", "profullstack", "profullstack-sharable-keys", "prod",
+                        "-o", out, "--yes"], capture_output=True, timeout=90, check=True)
+        with open(out) as f:
+            for row in csv.DictReader(f):
+                if row["key"] == "ANTHROPIC_API_KEY":
+                    return row["value"]
+    return None
+
+
+def ask(key):
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", method="POST",
+        data=json.dumps({"model": MODEL, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}).encode(),
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, ""
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", {}).get("message", "")
+        except Exception:
+            msg = ""
+        return e.code, msg
+
+
+def main():
+    try:
+        key = vault_key()
+    except Exception as e:
+        log(f"could not read the key from the vault: {e}")
+        return 2
+    if not key:
+        log("no ANTHROPIC_API_KEY in vault profullstack-sharable-keys--prod")
+        return 2
+    try:
+        status, msg = ask(key)
+    except Exception as e:
+        log(f"could not reach Anthropic: {e}")
+        return 2
+
+    if status == 200:
+        log("ok")
+        subprocess.run(["alert", "--clear", KEY_NAME])
+        return 0
+    low = msg.lower()
+    broken = status in (401, 403) or "credit balance" in low or "usage limit" in low or "billing" in low
+    if not broken:
+        # 429 / 5xx / a model name problem: not the outage this watches for.
+        log(f"HTTP {status} (not a credit or key problem, no alert): {msg[:200]}")
+        return 2
+    why = "is out of credits" if "credit balance" in low else "hit its usage limit" if "usage limit" in low else f"is refused (HTTP {status})"
+    text = f"The shared Anthropic API key {why}. About 14 apps have no AI until it is fixed."
+    log(f"HTTP {status}: {msg[:200]}")
+    if not DRY:
+        subprocess.run(["alert", "--key", KEY_NAME, "--every", "24h", text])
+    else:
+        print(f"would alert: {text}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -653,6 +653,10 @@ main().catch(async (e) => {
       const key = process.env.RESEND_API_KEY || loadSecrets().RESEND_API_KEY;
       if (key) await resend(key, { from: FROM, to: TO, subject: 'Fleet nightly FAILED', text: `The nightly fleet report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
     } catch (e2) { console.error(`fleet-nightly: could not mail the failure either: ${e2.message}`); }
+    // And a text or call (bin/alert), since a failure email can fail the same way.
+    try {
+      execFileSync('alert', ['--key', 'fleet-nightly', '--every', '12h', `fleet-nightly failed for ${DAY}: ${String(e && e.message || e).slice(0, 200)}`], { stdio: 'ignore', timeout: 120_000 });
+    } catch { console.error('fleet-nightly: alert failed too'); }
   }
   process.exit(1);
 });
