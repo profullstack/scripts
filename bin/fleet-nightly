@@ -53,7 +53,8 @@ advis0r.com spl00f.com bbs.profullstack.com outreachgraph.com reeleel.com rssamp
 bufferoverride.com tipoffwatch.com genrewatch.com p0dcasters.com d3vices.com diskpush.com
 hqtui.com chovy.com nichedb.dev readm3.com watchnews.now nixamp.com agenticjobs.work
 nightcell7.com r4ck.dev typeheard.com pwamart.com tleehealth.com hqterm.sh wx93.me sysops.ceo
-datamart.help hdtilt.com`.split(/\s+/).filter(Boolean);
+datamart.help hdtilt.com mediaanalyzer.pro demo.movie bg0ne.com meshhook.com
+vipvap.xyz complymist.com ringhuman.com airdpx.com submitfleet.com`.split(/\s+/).filter(Boolean);
 
 const CLICK_EVENTS = ['button_click', 'internal_click', 'outbound_click', 'download_click'];
 const AUTH_PATH = '(login|signin|sign-in|signup|sign-up|register|auth|magic|passkey|account)';
