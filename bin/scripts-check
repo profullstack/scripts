@@ -65,6 +65,7 @@ for f in bin/* install.sh; do
   case "$(head -1 "$f")" in
     *bash*) bash -n "$f" 2>&1 | sed "s/^/  /" ; [ "${PIPESTATUS[0]}" = 0 ] || fail "$f does not parse" ;;
     *node*) node --check "$f" >/dev/null 2>&1 || fail "$f does not parse" ;;
+    *python*) python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f" 2>&1 | sed "s/^/  /" ; [ "${PIPESTATUS[0]}" = 0 ] || fail "$f does not parse" ;;
     *sh*)   sh -n "$f"   2>&1 | sed "s/^/  /" ; [ "${PIPESTATUS[0]}" = 0 ] || fail "$f does not parse" ;;
     *)      note "  no shebang, skipped: $f" ;;
   esac
