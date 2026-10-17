@@ -132,7 +132,10 @@ async function accounts() {
       bookings: await q("select host_user_id u, created_at from booking_pages"),
       analyses: await q("select host_user_id u, created_at from call_analyses"),
       translation: await q("select user_id u, created_at from translation_usage"),
-      paid: await q("select (select count(*)::int from profiles where plan is not null and plan <> 'free') plans, (select count(*)::int from plan_payments where status in ('paid','confirmed','completed','credited')) payments"),
+      plans: await q("select id u, plan, plan_expires_at from profiles where plan is not null and plan <> 'free'"),
+      payments: await q("select user_id u, plan, amount_usd::float8 amount, status, created_at, credited_at from plan_payments"),
+      // PR #146: a join refused at the plan cap bumps sessions.settings.capRefusedCount; that is when the host sees the upgrade prompt.
+      caps: await q("select host_user_id host, (settings->>'capRefusedCount')::int refused, settings->>'capRefusedAt' refused_at from sessions where settings ? 'capRefusedCount'"),
     };
     console.log(JSON.stringify(out));
     await sql.close();`;
@@ -204,7 +207,45 @@ async function accounts() {
     bookings: allExt(db.bookings),
     analyses: allExt(db.analyses), analysesDay: count(db.analyses, DAY),
     translation: allExt(db.translation), translationDay: count(db.translation, DAY),
-    paidPlans: db.paid[0].plans, payments: db.paid[0].payments,
+    money: money(db, isExt, dayOf),
+  };
+}
+
+/**
+ * Paid plans and CoinPay plan payments. A plan_payments row is written when a
+ * checkout starts (status pending); credited_at is set once the webhook settles
+ * it and the plan is granted. Checkouts carry no record of which button started
+ * them (pricing page, cap prompt, /upgrade/<plan>), so prompt-driven checkouts
+ * cannot be told apart.
+ */
+function money(db, isExt, dayOf) {
+  const now = Date.now();
+  const live = db.plans.filter((p) => !p.plan_expires_at || Date.parse(p.plan_expires_at) > now);
+  const tiers = (rows) => Object.entries(rows.reduce((a, p) => ((a[p.plan] = (a[p.plan] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]);
+  const pays = db.payments.filter((p) => isExt(p.u)).map((p) => ({ ...p, day: dayOf(p.created_at), settledDay: dayOf(p.credited_at) }));
+  const settled = pays.filter((p) => p.credited_at);
+  const usd = (rows) => rows.reduce((a, p) => a + (Number(p.amount) || 0), 0);
+  const per = (d) => {
+    const c = pays.filter((p) => p.day === d), s = settled.filter((p) => p.settledDay === d);
+    return { started: c.length, startedUsd: usd(c), settled: s.length, settledUsd: usd(s) };
+  };
+  const firstSettled = settled.map((p) => p.settledDay).sort()[0] || null;
+  const caps = db.caps.filter((c) => isExt(c.host));
+  const capDay = (d) => caps.filter((c) => dayOf(c.refused_at) === d);
+  return {
+    tiers: tiers(live.filter((p) => isExt(p.u))),
+    internalTiers: tiers(live.filter((p) => !isExt(p.u))),
+    day: per(DAY), prev: per(PREV),
+    started30: pays.filter((p) => p.day >= addDays(DAY, -29) && p.day <= DAY).length,
+    startedAll: pays.filter((p) => p.day <= DAY).length,
+    settledAll: settled.filter((p) => p.settledDay <= DAY).length,
+    settledUsdAll: usd(settled.filter((p) => p.settledDay <= DAY)),
+    pendingAll: pays.filter((p) => !p.credited_at && p.day <= DAY).length,
+    byPlan: tiers(settled.filter((p) => p.settledDay <= DAY)),
+    firstSettled,
+    firstEverToday: firstSettled === DAY,
+    capRooms: caps.length, capRefusedAll: caps.reduce((a, c) => a + (c.refused || 0), 0),
+    capRoomsDay: capDay(DAY).length,
   };
 }
 
@@ -346,6 +387,23 @@ function verdict(r) {
     `Last outside signup: ${a.lastSignup ? dayLabel(a.lastSignup, true) : 'never'}.`;
 }
 
+const usd = (v) => `$${Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+const tierList = (t) => (t.length ? t.map(([k, v]) => `${esc(k)} ${n(v)}`).join(' · ') : 'none');
+
+function moneyHtml(m, row) {
+  const banner = m.firstEverToday
+    ? `<div style="font-size:15px;font-weight:700;margin:8px 0 4px;padding:10px 12px;border-left:3px solid #8a5a00;background:#fdf3dc;color:#8a5a00">First outside plan payment ever: ${usd(m.day.settledUsd)}.</div>`
+    : '';
+  return `<div style="font-size:15px;font-weight:700;margin:20px 0 4px">Money</div>${banner}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+${row('Paid plans active (outside)', `${tierList(m.tiers)}${m.internalTiers.length ? `<div style="font-size:11px;color:${MUTE}">ours, not counted: ${tierList(m.internalTiers)}</div>` : ''}`)}
+${row('Plan checkouts started that day', `${n(m.day.started)} (${usd(m.day.startedUsd)}) · ${esc(dayLabel(PREV))} ${n(m.prev.started)} · ${n(m.started30)} in 30 days · ${n(m.startedAll)} all-time`)}
+${row('Plan payments settled that day', `<b>${n(m.day.settled)} (${usd(m.day.settledUsd)})</b> · ${esc(dayLabel(PREV))} ${n(m.prev.settled)} (${usd(m.prev.settledUsd)})`)}
+${row('Settled all-time', `${n(m.settledAll)} (${usd(m.settledUsdAll)})${m.byPlan.length ? ` · ${tierList(m.byPlan)}` : ''} · ${n(m.pendingAll)} started but never settled${m.firstSettled ? ` · first ${esc(dayLabel(m.firstSettled, true))}` : ' · <b>no outside payment yet</b>'}`)}
+${row('Upgrade prompts (room at its plan cap)', `${n(m.capRoomsDay)} rooms turned someone away that day · ${n(m.capRooms)} rooms, ${n(m.capRefusedAll)} people turned away all-time<div style="font-size:11px;color:${MUTE}">only the cap refusal is logged (sessions.settings.capRefusedCount, PR #146); prompt views and which button started a checkout are not recorded</div>`)}
+</table>`;
+}
+
 function renderHtml(r, meta) {
   const tile = (label, cur, prev, sub) => `<td style="width:25%;background:#f4f4f2;border-radius:8px;padding:10px 12px;vertical-align:top">
 <div style="font-size:12px;color:${MUTE}">${label}</div>
@@ -388,6 +446,8 @@ ${tile('Used it', d ? d.active : null, a ? a.days[PREV].active : null, a ? 'outs
 <div style="font-size:15px;font-weight:700;margin:18px 0 6px">Last ${STRIP_DAYS} days</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${bars}</table>
 
+${a ? moneyHtml(a.money, row) : ''}
+
 <div style="font-size:15px;font-weight:700;margin:20px 0 4px">Meetings</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
 ${a ? row('Meetings started that day', `${n(d.meetings)} by outside hosts · ${n(d.together)} with 2+ people joining · ${n(d.joins)} joins (${n(d.guests)} guests)`) : ''}
@@ -398,7 +458,6 @@ ${a ? row('Scheduled meetings', `${n(a.scheduledDay)} created that day · ${n(a.
 ${a ? row('Recordings', `${n(a.recordingsDay)} that day · ${n(a.recordings)} all-time (${a.recordedHours.toFixed(1)} h)`) : ''}
 ${a ? row('Channels / orgs', `${n(a.channels)} channels (+${n(a.channelsDay)}) · ${n(a.orgs)} orgs (+${n(a.orgsDay)})`) : ''}
 ${a ? row('AI call analysis / translation', `${n(a.analyses)} analyses (+${n(a.analysesDay)}) · ${n(a.translation)} translation uses (+${n(a.translationDay)})`) : ''}
-${a ? row('Paid', `${n(a.paidPlans)} paid plans · ${n(a.payments)} payments`) : ''}
 ${a ? row('Users active in the last 30 days', n(a.active30)) : ''}
 ${a ? row('Latest outside signups', recent) : ''}
 </table>
@@ -436,6 +495,7 @@ function renderText(r, meta) {
     `pairux.com/download visitors: ${n(r.nginx?.page)}`,
     `New outside signups: ${n(d?.signups)} (${n(d?.confirmed)} confirmed) · used it: ${n(d?.active)} · meetings: ${n(d?.meetings)} (${n(d?.together)} with 2+ people)`,
     `pairux.com views: ${n(r.views?.[DAY])}`,
+    a ? `${a.money.firstEverToday ? '*** First outside plan payment ever *** ' : ''}Money: ${n(a.money.day.settled)} plan payments settled (${usd(a.money.day.settledUsd)}), ${n(a.money.day.started)} checkouts started, outside paid plans: ${tierList(a.money.tiers)}, all-time settled ${usd(a.money.settledUsdAll)}` : '',
     r.packages.choco ? `Chocolatey: ${n(r.packages.choco.total)} all-time` : '',
     r.packages.aur ? `AUR: ${n(r.packages.aur.votes)} votes, popularity ${r.packages.aur.popularity}` : '',
     meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
@@ -445,13 +505,14 @@ function renderText(r, meta) {
 function subjectLine(r) {
   const a = r.accounts, s = r.series[DAY] || {}, d = a?.days[DAY];
   const parts = [
+    a?.money.day.settled ? `${usd(a.money.day.settledUsd)} paid` : null,
     r.nginx ? `${plural(r.nginx.unique, 'script install')}` : 'installs unknown',
     s.downloads !== undefined ? `${n(s.downloads)} downloads` : null,
     d ? plural(d.signups, 'signup') : null,
     d ? plural(d.meetings, 'meeting') : null,
     a ? `${n(a.external)} real users total` : null,
   ].filter(Boolean);
-  return `PairUX ${dayLabel(DAY)}: ${parts.join(', ')}`;
+  return `PairUX ${dayLabel(DAY)}: ${a?.money.firstEverToday ? 'FIRST PAYMENT · ' : ''}${parts.join(', ')}`;
 }
 
 // ---------------------------------------------------------------- main

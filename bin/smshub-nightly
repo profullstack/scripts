@@ -1,0 +1,473 @@
+#!/usr/bin/env node
+// smshub-nightly — one email a night: did smshub.dev make money yesterday, how
+// many people came looking for a number, and are the rented numbers in use.
+// Our own accounts are taken out everywhere.
+//
+//   smshub-nightly                    send the report for yesterday (UTC)
+//   smshub-nightly --dry-run          build it, write it under the data dir, send nothing
+//   smshub-nightly --day 2026-10-16   report a specific UTC day
+//   smshub-nightly --to a@b.com,c@d   someone else (default anthony@ + preshy@profullstack.com)
+//
+// Sources, each of which may fail on its own and is then named in the email:
+//   money    number_orders in smshub's self-hosted Supabase Postgres on dev2: one row
+//            per CoinPay checkout (kind new = rent a number, renew = extend one);
+//            paid_at is when CoinPay's webhook settled it. phone_numbers (managed)
+//            gives rentals active / released and when they run out.
+//   usage    inbound messages (SMS and calls) on conversations of rented numbers;
+//            "codes" = SMS whose body holds a 4-8 digit run (OTPs). Bodies never
+//            leave the database query.
+//   funnel   auth.users signups / confirmations, plus the CrawlProof tracker rollups
+//            (tracker_event_daily_stats, tracker_visitor_daily_stats) of smshub's
+//            tracker project, found in crawlproof's `projects` by url.
+// Secrets: RESEND_API_KEY and CRAWLPROOF_DB_URL from the team vault fleet-nightly--prod.
+// The smshub DB URL is the dev2 fleet kit state (~/.local/state/dev2-fleet/smshub.dev.json).
+// Both databases are read in read-only transactions.
+
+import { execFile, execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  join(homedir(), '.bun/bin'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+  process.env.PATH || '',
+].join(':');
+
+const DATA_DIR = process.env.SMSHUB_NIGHTLY_DATA || join(homedir(), '.local/share/smshub-nightly');
+const STATE = join(process.env.DEV2_FLEET_STATE || join(homedir(), '.local/state/dev2-fleet'), 'smshub.dev.json');
+const SITE = 'smshub.dev';
+const DEFAULT_FROM = 'smshub nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'anthony@profullstack.com,preshy@profullstack.com';
+// Accounts that are us or our tests (riotcoder@ is @profullstack.com). Postgres regex syntax.
+const INTERNAL = '@(profullstack\\.com|smshub\\.dev|pairux\\.com|chovy\\.com|example\\.com|mailinator\\.com)$|^ettinger@gmail\\.com$|^riotcoder|^qa[.+-]|\\+qa@';
+// Pages that sell a number; the funnel counts their human page views.
+const PAGES = [['/', 'Home'], ['/numbers', '/numbers'], ['/verification-numbers', '/verification-numbers'], ['/register', '/register']];
+const STRIP_DAYS = 7;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = (opt('--to') || process.env.SMSHUB_REPORT_TO || DEFAULT_TO).split(',').map((s) => s.trim()).filter(Boolean);
+const FROM = process.env.SMSHUB_REPORT_FROM || DEFAULT_FROM;
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(DAY, i - STRIP_DAYS + 1));
+const FROM7 = addDays(DAY, -6), FROM30 = addDays(DAY, -29);
+const END = Date.parse(`${addDays(DAY, 1)}T00:00:00Z`); // end of the reported day
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  const p = execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000, env: { ...process.env, ...opts.env } }, (err, out, errOut) =>
+    err ? reject(new Error(`${cmd}: ${(errOut || err.message).trim().split('\n').slice(-3).join(' ')}`)) : resolve(out));
+  if (opts.input) { p.stdin.end(opts.input); }
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+let vaultCache;
+function vault() {
+  if (vaultCache) return vaultCache;
+  vaultCache = {};
+  const dir = mkdtempSync(join(tmpdir(), 'smshub-nightly-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    vaultCache = parseEnv(readFileSync(join(dir, 'env'), 'utf8'));
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  return vaultCache;
+}
+const secret = (k) => process.env[k] || vault()[k];
+
+function resendKey() {
+  const k = secret('RESEND_API_KEY');
+  if (k) return k;
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+/** Named read-only queries against one Postgres, through Bun's client. $1 = the internal-account regex. */
+async function pg(url, queries) {
+  const script = `
+    import { SQL } from "bun";
+    const sql = new SQL(process.env.DBURL);
+    await sql.unsafe("set session characteristics as transaction read only");
+    const [ro] = await sql.unsafe("show transaction_read_only");
+    if (ro.transaction_read_only !== "on") throw new Error("not read-only");
+    const qs = JSON.parse(process.env.QUERIES), out = {};
+    for (const [k, q] of Object.entries(qs)) out[k] = await sql.unsafe(q.sql, q.params || []);
+    console.log(JSON.stringify(out));
+    await sql.close();`;
+  const out = await run('bun', ['-e', script], { env: { DBURL: url, QUERIES: JSON.stringify(queries) }, timeout: 90_000 });
+  return JSON.parse(out.trim().split('\n').pop());
+}
+
+const dayOf = (t) => (t ? new Date(t).toISOString().slice(0, 10) : null);
+const within = (d, from, to = DAY) => d && d >= from && d <= to;
+const sum = (xs, f = (x) => x) => xs.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+
+// ---------------------------------------------------------------- sources
+
+/** Accounts, orders, rentals and inbound traffic on rented numbers. Emails and bodies never leave the queries. */
+async function smshub() {
+  const url = JSON.parse(readFileSync(STATE, 'utf8')).sb_database_url;
+  const P = [INTERNAL];
+  const db = await pg(url, {
+    users: { sql: `select id, created_at, email_confirmed_at is not null confirmed, coalesce(email, '') ~* $1 internal, split_part(coalesce(email, '?@?'), '@', 2) domain from auth.users order by created_at`, params: P },
+    orders: { sql: `select id, user_id, kind, phone_number_id pn, months, amount_usd::float8 amount, chain, status, created_at, paid_at from number_orders order by created_at` },
+    numbers: { sql: `select id, user_id, created_at, status, expires_at, released_at from phone_numbers where managed` },
+    byo: { sql: `select count(*)::int n, count(distinct user_id)::int users from phone_numbers where not managed and status = 'active'` },
+    inbound: { sql: `select c.phone_number_id pn, (m.created_at at time zone 'UTC')::date::text d, m.kind, count(*)::int n,
+        count(*) filter (where m.kind = 'sms' and m.body ~ '(^|[^0-9])[0-9]{4,8}([^0-9]|$)')::int codes
+      from messages m join conversations c on c.id = m.conversation_id
+      where m.direction = 'inbound' group by 1, 2, 3` },
+  });
+
+  const internal = new Set(db.users.filter((u) => u.internal).map((u) => u.id));
+  const isExt = (id) => id && !internal.has(id);
+  const ext = db.users.filter((u) => isExt(u.id)).map((u) => ({ ...u, created: dayOf(u.created_at) }));
+  const orders = db.orders.filter((o) => isExt(o.user_id)).map((o) => ({ ...o, day: dayOf(o.created_at), paidDay: dayOf(o.paid_at) }));
+  const paid = orders.filter((o) => o.paid_at);
+  const numbers = db.numbers.filter((x) => isExt(x.user_id));
+  const managedIds = new Set(numbers.map((x) => x.id));
+  const inbound = db.inbound.filter((r) => managedIds.has(r.pn));
+
+  // A buyer's first paid order is a new paying customer.
+  const firstPaid = {};
+  for (const o of [...paid].sort((a, b) => Date.parse(a.paid_at) - Date.parse(b.paid_at))) firstPaid[o.user_id] ||= o.id;
+
+  const activeAt = (t) => numbers.filter((x) => Date.parse(x.created_at) < t && (!x.released_at || Date.parse(x.released_at) >= t));
+  const monthlyOf = (pn) => {
+    const o = paid.filter((p) => p.pn === pn).sort((a, b) => Date.parse(b.paid_at) - Date.parse(a.paid_at))[0];
+    return o ? o.amount / o.months : 0;
+  };
+
+  const per = (d) => {
+    const t = Date.parse(`${addDays(d, 1)}T00:00:00Z`);
+    const paidD = paid.filter((o) => o.paidDay === d);
+    const inD = inbound.filter((r) => r.d === d);
+    return {
+      signups: ext.filter((u) => u.created === d).length,
+      confirmed: ext.filter((u) => u.created === d && u.confirmed).length,
+      checkouts: orders.filter((o) => o.day === d).length,
+      checkoutsNew: orders.filter((o) => o.day === d && o.kind === 'new').length,
+      buyers: new Set(orders.filter((o) => o.day === d).map((o) => o.user_id)).size,
+      paid: paidD.length,
+      usd: sum(paidD, (o) => o.amount),
+      newRentals: paidD.filter((o) => o.kind === 'new').length,
+      renewals: paidD.filter((o) => o.kind === 'renew').length,
+      newCustomers: paidD.filter((o) => firstPaid[o.user_id] === o.id).length,
+      released: numbers.filter((x) => dayOf(x.released_at) === d).length,
+      active: activeAt(t).length,
+      sms: sum(inD.filter((r) => r.kind === 'sms'), (r) => r.n),
+      codes: sum(inD, (r) => r.codes),
+      calls: sum(inD.filter((r) => r.kind === 'call'), (r) => r.n),
+      numbersUsed: new Set(inD.map((r) => r.pn)).size,
+    };
+  };
+  const range = (from) => {
+    const ds = []; for (let d = from; d <= DAY; d = addDays(d, 1)) ds.push(per(d));
+    const out = {};
+    for (const k of Object.keys(ds[0])) if (k !== 'active') out[k] = sum(ds, (x) => x[k]);
+    return out;
+  };
+  const activeNow = activeAt(END);
+  const soon = Date.parse(`${addDays(DAY, 8)}T00:00:00Z`);
+  const statusCount = (s) => orders.filter((o) => o.status === s).length;
+  const firstEver = paid.length ? [...paid].sort((a, b) => Date.parse(a.paid_at) - Date.parse(b.paid_at))[0] : null;
+
+  return {
+    total: db.users.length, internal: internal.size, external: ext.length,
+    confirmedAll: ext.filter((u) => u.confirmed).length,
+    days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])),
+    r7: range(FROM7), r30: range(FROM30),
+    revenueAll: sum(paid.filter((o) => o.paidDay <= DAY), (o) => o.amount),
+    paidAll: paid.filter((o) => o.paidDay <= DAY).length,
+    customers: new Set(paid.filter((o) => o.paidDay <= DAY).map((o) => o.user_id)).size,
+    repeatCustomers: Object.values(paid.filter((o) => o.paidDay <= DAY).reduce((a, o) => ((a[o.user_id] = (a[o.user_id] || 0) + 1), a), {})).filter((k) => k > 1).length,
+    checkoutsAll: orders.filter((o) => o.day <= DAY).length,
+    abandoned: statusCount('expired'), failed: statusCount('failed'), pending: statusCount('pending'),
+    stuckPaid: orders.filter((o) => o.status === 'paid').length, // paid but not provisioned yet
+    firstEverDay: firstEver?.paidDay ?? null,
+    activeNow: activeNow.length,
+    runRate: sum(activeNow, (x) => monthlyOf(x.id)),
+    expiring7: activeNow.filter((x) => x.expires_at && Date.parse(x.expires_at) < soon).length,
+    releasedAll: numbers.filter((x) => x.released_at && Date.parse(x.released_at) < END).length,
+    chains: Object.entries(paid.reduce((a, o) => ((a[o.chain] = (a[o.chain] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]),
+    terms: Object.entries(orders.filter((o) => within(o.day, FROM30)).reduce((a, o) => ((a[`${o.months} mo`] = (a[`${o.months} mo`] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]),
+    smsAll: sum(inbound.filter((r) => r.kind === 'sms' && r.d <= DAY), (r) => r.n),
+    codesAll: sum(inbound.filter((r) => r.d <= DAY), (r) => r.codes),
+    byo: db.byo[0],
+  };
+}
+
+/** Human traffic on smshub.dev from the CrawlProof tracker rollups. */
+async function traffic() {
+  const url = secret('CRAWLPROOF_DB_URL');
+  if (!url) throw new Error('no CRAWLPROOF_DB_URL');
+  const host = SITE.replace(/\./g, '\\.');
+  const proj = await pg(url, { p: { sql: `select id::text id from projects where url ~* $1 and archived_at is null order by tracker_enabled desc nulls last, created_at limit 1`, params: [`^https?://(www\\.)?${host}(/|$)`] } });
+  const id = proj.p[0]?.id;
+  if (!id) throw new Error(`no tracker project for ${SITE}`);
+  const from = addDays(FROM30, -1);
+  const db = await pg(url, {
+    ev: { sql: `select day::text d, event, page_path p, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1, 2, 3`, params: [id, from, DAY] },
+    vis: { sql: `select day::text d, count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1`, params: [id, from, DAY] },
+    refs: { sql: `select coalesce(nullif(referrer_host, ''), 'direct') h, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and event = 'pageview' and day = $2
+        and coalesce(referrer_host, '') not in ($3, $4) group by 1 order by 2 desc limit 6`, params: [id, DAY, SITE, `www.${SITE}`] },
+  });
+  const pv = (d, path) => sum(db.ev.filter((r) => r.d === d && r.event === 'pageview' && (path === undefined || r.p === path)), (r) => r.n);
+  const per = (d) => ({
+    visitors: db.vis.find((r) => r.d === d)?.v ?? 0,
+    views: pv(d),
+    pages: Object.fromEntries(PAGES.map(([p]) => [p, pv(d, p)])),
+    registerSubmits: sum(db.ev.filter((r) => r.d === d && r.event === 'form_submit' && r.p === '/register'), (r) => r.n),
+  });
+  const range = (fromD) => {
+    const out = { visitors: 0, views: 0, pages: Object.fromEntries(PAGES.map(([p]) => [p, 0])), registerSubmits: 0 };
+    for (let d = fromD; d <= DAY; d = addDays(d, 1)) {
+      const x = per(d);
+      out.visitors += x.visitors; out.views += x.views; out.registerSubmits += x.registerSubmits;
+      for (const [p] of PAGES) out.pages[p] += x.pages[p];
+    }
+    return out;
+  };
+  const top = Object.entries(db.ev.filter((r) => r.d === DAY && r.event === 'pageview').reduce((a, r) => ((a[r.p] = (a[r.p] || 0) + r.n), a), {}))
+    .sort((a, b) => b[1] - a[1]).slice(0, 8);
+  return { project: id, days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])), r7: range(FROM7), r30: range(FROM30), top, refs: db.refs };
+}
+
+// ---------------------------------------------------------------- render
+
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6', GOLD = '#8a5a00';
+const n = (v) => (v === null || v === undefined ? '·' : Number(v).toLocaleString('en-US'));
+const usd = (v) => (v === null || v === undefined ? '·' : `$${Number(v).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const signed = (d, f = n) => (d > 0 ? `+${f(d)}` : d < 0 ? `-${f(-d)}` : '±0');
+const plural = (k, word, many = `${word}s`) => `${n(k)} ${k === 1 ? word : many}`;
+const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(a / b < 0.1 ? 1 : 0)}%` : '·');
+
+function verdict(r) {
+  const s = r.smshub;
+  if (!s) return 'The smshub database was unreadable tonight, so there are no money numbers.';
+  const d = s.days[DAY];
+  const t = r.traffic?.days[DAY];
+  return `${usd(d.usd)} settled on ${dayLabel(DAY)} from ${plural(d.paid, 'paid order')} (${n(d.newRentals)} new, ${n(d.renewals)} renewals); ` +
+    `${plural(d.checkouts, 'checkout')} opened by ${plural(d.buyers, 'person', 'people')}. ` +
+    `${plural(s.activeNow, 'outside rental')} active, run-rate ${usd(s.runRate)}/mo. ` +
+    `All-time: ${usd(s.revenueAll)} from ${plural(s.customers, 'paying customer')} of ${n(s.external)} outside accounts. ` +
+    `${t ? `${n(t.visitors)} visitors, ` : ''}${plural(d.signups, 'signup')}.`;
+}
+
+function renderHtml(r, meta) {
+  const s = r.smshub, t = r.traffic;
+  const d = s?.days[DAY], dp = s?.days[PREV];
+  const tile = (label, cur, prev, sub, fmt = n) => `<td style="width:25%;background:#f4f4f2;border-radius:8px;padding:10px 12px;vertical-align:top">
+<div style="font-size:12px;color:${MUTE}">${label}</div>
+<div style="font-size:24px;font-weight:700;margin-top:2px">${fmt(cur)}</div>
+<div style="font-size:12px;color:${prev === null || cur === null || prev === undefined ? MUTE : cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev === null || cur === null || prev === undefined ? '&nbsp;' : `${signed(cur - prev, fmt === usd ? usd : n)} vs ${esc(dayLabel(PREV))}`}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:4px">${sub}</div></td>`;
+
+  const newBuyer = d && d.newCustomers > 0;
+  const firstEver = s && s.firstEverDay === DAY;
+  const banner = firstEver
+    ? `<div style="font-size:15px;font-weight:700;margin-top:12px;padding:10px 12px;border-left:3px solid ${GOLD};background:#fdf3dc;color:${GOLD}">First outside payment ever: ${usd(d.usd)}.</div>`
+    : newBuyer ? `<div style="font-size:14px;font-weight:700;margin-top:12px;padding:10px 12px;border-left:3px solid ${UP};background:#e9f6ec;color:${UP}">${plural(d.newCustomers, 'new paying customer')} on ${esc(dayLabel(DAY))}.</div>` : '';
+
+  // 7-day strip: checkouts opened (light) and paid (dark), with signups alongside.
+  const max = Math.max(1, ...DAYS.map((x) => s?.days[x]?.checkouts || 0));
+  const bars = DAYS.map((x) => {
+    const sd = s?.days[x], td = t?.days[x];
+    const w = sd ? Math.max(sd.checkouts ? 2 : 0, Math.round((sd.checkouts / max) * 100)) : 0;
+    const wp = sd && sd.checkouts ? Math.round((sd.paid / sd.checkouts) * w) : 0;
+    return `<tr><td style="font-size:12px;color:${x === DAY ? INK : MUTE};padding:2px 8px 2px 0;white-space:nowrap;width:90px">${esc(dayLabel(x))}</td>
+<td style="padding:2px 0"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>${wp ? `<td style="width:${wp}%;background:${UP};height:10px;font-size:0;line-height:0">&nbsp;</td>` : ''}${w - wp > 0 ? `<td style="width:${w - wp}%;background:${x === DAY ? BLUE : '#9dbfee'};height:10px;font-size:0;line-height:0">&nbsp;</td>` : ''}<td style="font-size:0">&nbsp;</td></tr></table></td>
+<td style="font-size:12px;text-align:right;padding-left:8px;white-space:nowrap;width:270px">${sd ? `${n(sd.checkouts)} checkouts · ${n(sd.paid)} paid ${usd(sd.usd)} · ${n(sd.signups)} signups` : '·'}${td ? ` · ${n(td.visitors)} vis` : ''}</td></tr>`;
+  }).join('');
+
+  const row = (k, v) => `<tr><td style="padding:6px 8px 6px 0;border-bottom:1px solid ${LINE};color:${MUTE};vertical-align:top">${k}</td><td style="padding:6px 0;border-bottom:1px solid ${LINE};text-align:right">${v}</td></tr>`;
+  const th = (x) => `<td style="padding:4px 0 4px 10px;font-size:11px;color:${MUTE};text-align:right;border-bottom:1px solid ${LINE}">${x}</td>`;
+  const frow = (label, cur, prev, w7, w30, sub = '') => `<tr><td style="padding:6px 8px 6px 0;border-bottom:1px solid ${LINE};color:${MUTE}">${label}${sub ? `<div style="font-size:11px">${sub}</div>` : ''}</td>
+<td style="padding:6px 0 6px 10px;border-bottom:1px solid ${LINE};text-align:right;font-weight:700">${n(cur)}</td>
+<td style="padding:6px 0 6px 10px;border-bottom:1px solid ${LINE};text-align:right;color:${cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev === undefined ? '·' : signed(cur - prev)}</td>
+<td style="padding:6px 0 6px 10px;border-bottom:1px solid ${LINE};text-align:right">${n(w7)}</td>
+<td style="padding:6px 0 6px 10px;border-bottom:1px solid ${LINE};text-align:right">${n(w30)}</td></tr>`;
+
+  const td = t?.days[DAY], tp = t?.days[PREV];
+  const funnel = [
+    t ? frow('Unique visitors', td.visitors, tp.visitors, t.r7.visitors, t.r30.visitors, 'summed per day') : '',
+    ...(t ? PAGES.map(([p, label]) => frow(`${esc(label)} views`, td.pages[p], tp.pages[p], t.r7.pages[p], t.r30.pages[p])) : []),
+    s ? frow('Signups', d.signups, dp.signups, s.r7.signups, s.r30.signups) : '',
+    s ? frow('Confirmed email', d.confirmed, dp.confirmed, s.r7.confirmed, s.r30.confirmed, 'of that day\'s signups, so far') : '',
+    s ? frow('Checkouts opened', d.checkouts, dp.checkouts, s.r7.checkouts, s.r30.checkouts) : '',
+    s ? frow('Paid', d.paid, dp.paid, s.r7.paid, s.r30.paid) : '',
+  ].join('');
+  const conv = s && t ? `visitor → signup ${pct(s.r30.signups, t.r30.visitors)} · signup → checkout ${pct(s.r30.buyers, s.r30.signups)} · checkout → paid ${pct(s.r30.paid, s.r30.checkouts)} (30 days)` : '';
+
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">smshub nightly · ${esc(dayLabel(DAY, true))}</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">UTC day · our own and test accounts excluded · compared with ${esc(dayLabel(PREV))}</div>
+${banner}
+<div style="font-size:14px;margin-top:12px;padding:10px 12px;border-left:3px solid ${BLUE};background:#eef3fb">${esc(verdict(r))}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:14px -6px 0;border-collapse:separate"><tr>
+${tile('Revenue settled', d ? d.usd : null, dp ? dp.usd : null, s ? `${usd(s.r7.usd)} in 7d · ${usd(s.r30.usd)} in 30d` : 'DB unreadable', usd)}
+${tile('Paid orders', d ? d.paid : null, dp ? dp.paid : null, d ? `${n(d.newRentals)} new · ${n(d.renewals)} renewals · ${plural(d.checkouts, 'checkout')} opened` : '')}
+${tile('Active rentals', d ? d.active : null, dp ? dp.active : null, s ? `run-rate ${usd(s.runRate)}/mo · ${n(s.expiring7)} run out within 7 days` : '')}
+${tile('Signups', d ? d.signups : null, dp ? dp.signups : null, s ? `${n(d.confirmed)} confirmed · ${n(s.r7.signups)} in 7d · ${n(s.r30.signups)} in 30d` : '')}
+</tr></table>
+
+<div style="font-size:15px;font-weight:700;margin:18px 0 6px">Last ${STRIP_DAYS} days <span style="font-size:12px;font-weight:400;color:${MUTE}">checkouts opened, green = paid</span></div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${bars}</table>
+
+<div style="font-size:15px;font-weight:700;margin:20px 0 4px">Money</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+${s ? row('Settled that day', `${usd(d.usd)} · ${plural(d.paid, 'order')} (${n(d.newRentals)} new rentals, ${n(d.renewals)} renewals) · ${plural(d.newCustomers, 'new customer')}`) : ''}
+${s ? row('Settled all-time', `${usd(s.revenueAll)} · ${plural(s.paidAll, 'order')} · ${plural(s.customers, 'customer')} (${n(s.repeatCustomers)} paid more than once)${s.firstEverDay ? ` · first ${esc(dayLabel(s.firstEverDay, true))}` : ''}`) : ''}
+${s ? row('Rentals', `${n(s.activeNow)} active now · ${n(d.released)} ended that day · ${n(s.releasedAll)} ended all-time · ${n(s.expiring7)} run out within 7 days`) : ''}
+${s ? row('Checkouts all-time', `${n(s.checkoutsAll)} opened · ${n(s.paidAll)} paid · ${n(s.abandoned)} expired unpaid · ${n(s.pending)} still open${s.failed ? ` · <span style="color:${DOWN}">${n(s.failed)} failed</span>` : ''}${s.stuckPaid ? ` · <span style="color:${DOWN}">${n(s.stuckPaid)} paid but not provisioned</span>` : ''}`) : ''}
+${s && s.chains.length ? row('Paid with', s.chains.map(([k, v]) => `${esc(k)} ${n(v)}`).join(' · ')) : ''}
+${s && s.terms.length ? row('Terms asked for, 30 days', s.terms.map(([k, v]) => `${esc(k)} ${n(v)}`).join(' · ')) : ''}
+</table>
+
+<div style="font-size:15px;font-weight:700;margin:20px 0 4px">Funnel</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+<tr><td style="border-bottom:1px solid ${LINE}"></td>${th(esc(dayLabel(DAY)))}${th('vs prev')}${th('7 days')}${th('30 days')}</tr>
+${funnel}
+</table>
+${conv ? `<div style="font-size:12px;color:${MUTE};margin-top:6px">${esc(conv)}</div>` : ''}
+
+<div style="font-size:15px;font-weight:700;margin:20px 0 4px">Usage of rented numbers</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+${s ? row('Inbound SMS that day', `${n(d.sms)} (${n(d.codes)} with a code) on ${plural(d.numbersUsed, 'number')} · ${esc(dayLabel(PREV))} ${n(dp.sms)}`) : ''}
+${s ? row('Inbound SMS, 7 / 30 days', `${n(s.r7.sms)} / ${n(s.r30.sms)} · codes ${n(s.r7.codes)} / ${n(s.r30.codes)}`) : ''}
+${s ? row('Inbound SMS all-time', `${n(s.smsAll)} (${n(s.codesAll)} codes)`) : ''}
+${s ? row('Inbound calls', `${n(d.calls)} that day · ${n(s.r30.calls)} in 30 days`) : ''}
+${s ? row('Bring-your-own numbers', `${n(s.byo.n)} active across ${plural(s.byo.users, 'account')} (all accounts)`) : ''}
+${s ? row('Accounts', `${n(s.external)} outside (of ${n(s.total)}; ${n(s.internal)} ours or QA) · ${n(s.confirmedAll)} confirmed`) : ''}
+</table>
+
+${t ? `<div style="font-size:15px;font-weight:700;margin:20px 0 4px">Traffic that day</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">
+${row('Page views', `${n(td.views)} · ${esc(dayLabel(PREV))} ${n(tp.views)} · /register form submits ${n(td.registerSubmits)}`)}
+${row('Top pages', t.top.map(([p, v]) => `${esc(p)} ${n(v)}`).join('<br>') || 'none')}
+${row('Outside referrers', t.refs.map((x) => `${esc(x.h)} ${n(x.n)}`).join(' · ') || 'none')}
+</table>` : ''}
+
+${meta.problems.length ? `<div style="font-size:12px;color:${DOWN};margin-top:12px"><b>Sources skipped:</b> ${meta.problems.map(esc).join('; ')}</div>` : ''}
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">Money = number_orders whose CoinPay payment settled (paid_at) that UTC day, at the order's USD price; "new customer" = that buyer's first paid order. Active rentals = managed numbers of outside accounts not released by the end of the day; run-rate = each active rental's last paid price per month. Checkouts opened = number_orders created (each opens a CoinPay invoice); unpaid ones expire. Codes = inbound SMS on rented numbers containing a 4-8 digit run. Visitors and page views = CrawlProof tracker, humans only; unique visitors are counted per day and summed for 7/30 days. Accounts matching ${esc(INTERNAL)} are counted as ours. Generated by smshub-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
+</td></tr></table></div>`;
+}
+
+function renderText(r, meta) {
+  const s = r.smshub, t = r.traffic, d = s?.days[DAY], td = t?.days[DAY];
+  return [
+    `smshub nightly · ${dayLabel(DAY, true)}`,
+    '',
+    s && s.firstEverDay === DAY ? '*** First outside payment ever ***\n' : d?.newCustomers ? `*** ${plural(d.newCustomers, 'new paying customer')} ***\n` : '',
+    verdict(r),
+    '',
+    s ? `Revenue settled: ${usd(d.usd)} (${usd(s.r7.usd)} 7d, ${usd(s.r30.usd)} 30d, ${usd(s.revenueAll)} all-time)` : '',
+    s ? `Paid orders: ${n(d.paid)} (${n(d.newRentals)} new, ${n(d.renewals)} renewals) of ${n(d.checkouts)} checkouts opened` : '',
+    s ? `Active rentals: ${n(s.activeNow)}, run-rate ${usd(s.runRate)}/mo, ${n(d.released)} ended, ${n(s.expiring7)} run out within 7 days` : '',
+    td ? `Visitors: ${n(td.visitors)} · home ${n(td.pages['/'])} · /numbers ${n(td.pages['/numbers'])} · /verification-numbers ${n(td.pages['/verification-numbers'])} · /register ${n(td.pages['/register'])}` : '',
+    s ? `Signups: ${n(d.signups)} (${n(d.confirmed)} confirmed)` : '',
+    s ? `Inbound on rented numbers: ${n(d.sms)} SMS (${n(d.codes)} codes) on ${plural(d.numbersUsed, 'number')}, ${n(d.calls)} calls` : '',
+    meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+function subjectLine(r) {
+  const s = r.smshub, d = s?.days[DAY], td = r.traffic?.days[DAY];
+  const parts = [
+    d ? `${usd(d.usd)} settled` : 'money unknown',
+    d ? `${n(d.paid)}/${n(d.checkouts)} checkouts paid` : null,
+    s ? plural(s.activeNow, "active rental") : null,
+    d ? plural(d.signups, 'signup') : null,
+    td ? `${n(td.visitors)} visitors` : null,
+  ].filter(Boolean);
+  const lead = s && s.firstEverDay === DAY ? 'FIRST PAYMENT · ' : d?.newCustomers ? 'New customer · ' : '';
+  return `smshub ${dayLabel(DAY)}: ${lead}${parts.join(', ')}`;
+}
+
+// ---------------------------------------------------------------- main
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+async function main() {
+  const t0 = Date.now();
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name} (${e.message.slice(0, 160)})`); return null; } };
+  const [sh, tr] = await Promise.all([settle('smshub db', smshub), settle('tracker', traffic)]);
+  if (!sh && !tr) throw new Error(`no source answered:\n  ${problems.join('\n  ')}`);
+
+  const r = { smshub: sh, traffic: tr };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', problems };
+  const html = renderHtml(r, meta), text = renderText(r, meta), subject = subjectLine(r);
+  const d = sh?.days[DAY], td = tr?.days[DAY];
+  const snap = {
+    day: DAY, usd: d?.usd, paid: d?.paid, checkouts: d?.checkouts, newRentals: d?.newRentals, renewals: d?.renewals,
+    active: d?.active, released: d?.released, signups: d?.signups, confirmed: d?.confirmed, sms: d?.sms, codes: d?.codes,
+    visitors: td?.visitors, pages: td?.pages, revenueAll: sh?.revenueAll, customers: sh?.customers, external: sh?.external,
+  };
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(join(DATA_DIR, 'out'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'out', 'latest.html'), html);
+  writeFileSync(join(DATA_DIR, 'out', 'latest.txt'), text);
+  writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify(snap));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(DATA_DIR, 'out', 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(key, { from: FROM, to: TO, subject, html, text });
+  console.log(`sent ${id} to ${TO.join(', ')}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`smshub-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = resendKey();
+      if (key) await resend(key, { from: FROM, to: TO, subject: 'smshub nightly FAILED', text: `The smshub report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`smshub-nightly: could not mail the failure either: ${e2.message}`); }
+  }
+  process.exit(1);
+});
