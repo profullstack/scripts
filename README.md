@@ -391,3 +391,25 @@ nichedb-nightly --from-json FILE   render saved numbers instead of reading
 ```
 
 Runs from cron at 05:05 UTC. A failure is mailed as "NicheDB nightly FAILED".
+
+## pairux-nightly
+
+The nightly PairUX report: installs, downloads and real users, in the same
+shape as tron-nightly. PairUX has no telemetry and the desktop app does not
+phone home for updates, so installs are counted where people fetch the bits:
+outside IPs fetching `install.sh` / `install.ps1` and visiting `/download` in
+dev2's shared nginx log (kept ~2 days, so the nightly must capture each day),
+the daily rise in GitHub release installer downloads, Chocolatey, AUR, npm,
+and GitHub clone counts of the brew/scoop/apt/rpm/nix/gentoo repos. Accounts
+and usage (signups, meetings, joins, chat, recordings, channels, orgs) come
+from the pairux Supabase Postgres on dev2, read-only, with our own and QA
+accounts counted apart.
+
+```
+pairux-nightly                     mail yesterday's (UTC) report
+pairux-nightly --dry-run           build it under ~/.local/share/pairux-nightly, send nothing
+pairux-nightly --day 2026-10-16    a specific UTC day
+pairux-nightly --to a@b.com,c@d    someone else (default anthony@ + preshy@profullstack.com)
+```
+
+Runs from cron at 05:45 UTC. A failure is mailed as "PairUX nightly FAILED".
