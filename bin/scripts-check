@@ -96,6 +96,16 @@ else
   note "shellcheck not installed, skipped (apt-get install shellcheck)"
 fi
 
+# ---------------------------------------------------------------- tests
+
+# test/*.sh drive a script against fakes (no network, no real email). Each
+# exits non-zero on a failed case and skips itself when a tool is missing.
+for t in test/*.sh; do
+  [ -f "$t" ] || continue
+  note "test $t"
+  bash "$t" || fail "$t"
+done
+
 # ---------------------------------------------------------------- verdict
 
 if [ "$rc" = 0 ]; then
