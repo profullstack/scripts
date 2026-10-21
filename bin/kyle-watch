@@ -1,0 +1,344 @@
+#!/usr/bin/env node
+// kyle-watch — watch Kyle (GoldClub IPTV / Xtremity, the CoinPay chargeback ring
+// FlexSystemsInc + FlexTools) like a hawk: every sale he takes where we can see it.
+//
+//   kyle-watch tick                 every 5 min: email each new sale/status change,
+//                                   call-alert on a new business or dispute
+//   kyle-watch tick --seed          record what is there now without alerting
+//   kyle-watch daily                yesterday's report: completed vs failed etc.
+//   kyle-watch daily --dry-run      build it, print it, send nothing
+//   kyle-watch daily --day 2026-10-20
+//   --to a@b.com                    someone else (default ettinger@gmail.com)
+//
+// What we can see:
+//   coinpay   coinpayportal's Postgres (container coinpayportal-com-supabase-db on
+//             dev2): his merchants, any business whose webhook points at
+//             goldclub*/uranusx/xtremity, and any business sharing one of his own
+//             payout wallets. So a rotated account is picked up automatically.
+//             Stripe amounts are cents; PayPal and crypto amounts are dollars.
+//   btc       his own payout address on-chain (mempool.space): net incoming = a sale,
+//             net outgoing = a cash-out.
+//   sites     whether his storefronts answer.
+// What we cannot see: card or PayPal sales he takes through someone else.
+//
+// Our house wallets were also set on FlexSystemsInc; the house merchant is always
+// excluded so our own fleet never shows up as his.
+
+import { execFile, execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [join(homedir(), '.local/bin'), join(homedir(), '.local/share/mise/shims'), '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH || ''].join(':');
+
+const DATA_DIR = process.env.KYLE_WATCH_DATA || join(homedir(), '.local/share/kyle-watch');
+const STATE_FILE = join(DATA_DIR, 'state.json');
+const DB_CONTAINER = 'coinpayportal-com-supabase-db';
+const MERCHANTS = ['f7077d86-1236-4f24-b9c7-d50da3126334', 'd2976680-64ee-4cf2-b768-a12444e28218'];
+const HOUSE_MERCHANT = '5d79f032-b9ec-42b6-a34a-577c9ab9688d';
+const DOMAIN_RE = 'goldclub|uranusx|xtremity';
+const WALLETS = ['bc1q5haxj3whvwcnta6stw0046jcwgazysm8s3mjur', 'bc1qdzacv2ykk989t8ujkmktag34xlu3p8hmwcj84j', '0x07bb74fC9d10a3f1d68f097634E098432a411Ee0'];
+const BTC_WATCH = WALLETS.filter((w) => w.startsWith('bc1'));
+const SITES = ['uranusx-tv.com', 'goldclubiptv.com'];
+const FROM = 'Kyle watch <pulse@profullstack.com>';
+
+const args = process.argv.slice(2);
+const flag = (n) => args.includes(n);
+const opt = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
+const CMD = args[0];
+const DRY = flag('--dry-run');
+const TO = opt('--to') || process.env.KYLE_WATCH_TO || 'ettinger@gmail.com';
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const usd = (n) => `$${(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  const p = execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000 }, (err, out, errOut) =>
+    err ? reject(new Error(`${cmd}: ${(errOut || err.message).trim().split('\n').slice(-3).join(' ')}`)) : resolve(out));
+  if (opts.input) p.stdin.end(opts.input);
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+function resendKey() {
+  if (process.env.RESEND_API_KEY) return process.env.RESEND_API_KEY;
+  const dir = mkdtempSync(join(tmpdir(), 'kyle-watch-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    const k = parseEnv(readFileSync(join(dir, 'env'), 'utf8')).RESEND_API_KEY;
+    if (k) return k;
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+async function resend(body) {
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: FROM, to: [TO], ...body }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+const alertCall = (key, msg) => run('alert', ['--key', `kyle-watch-${key}`, '--every', '24h', msg]).catch((e) => console.error(`alert: ${e.message}`));
+
+// ---------------------------------------------------------------- coinpay
+
+const lit = (xs) => `array[${xs.map((x) => `'${x.replace(/'/g, "''")}'`).join(',')}]`;
+const KB = `
+  kb as (
+    select id from businesses
+     where (merchant_id::text = any(${lit(MERCHANTS)}) or webhook_url ~* '${DOMAIN_RE}') and merchant_id <> '${HOUSE_MERCHANT}'
+    union
+    select w.business_id from business_wallets w join businesses b on b.id = w.business_id
+     where w.wallet_address = any(${lit(WALLETS)}) and b.merchant_id <> '${HOUSE_MERCHANT}'
+  ),
+  km as (select distinct merchant_id as id from businesses where id in (select id from kb))`;
+
+async function sql(q) {
+  const out = await run('docker', ['exec', '-i', DB_CONTAINER, 'psql', '-U', 'postgres', '-d', 'postgres', '-At', '-v', 'ON_ERROR_STOP=1', '-c', `with ${KB} select coalesce(json_agg(t), '[]') from (${q}) t`]);
+  return JSON.parse(out.trim() || '[]');
+}
+
+// One row shape for every rail: {rail, id, status, usd, at, who, business}.
+const RAILS = {
+  card: `select 'card' rail, s.id, s.status, s.amount / 100.0 usd, s.created_at at, s.updated_at, s.customer_email who, b.name business, s.failure_reason why
+           from stripe_transactions s left join businesses b on b.id = s.business_id
+          where s.merchant_id in (select id from km) or s.business_id in (select id from kb)`,
+  paypal: `select 'paypal' rail, p.id, p.status, p.amount::float usd, p.created_at at, p.updated_at, coalesce(p.payer_email, p.customer_email) who, b.name business, p.failure_reason why
+             from paypal_transactions p left join businesses b on b.id = p.business_id
+            where p.merchant_id in (select id from km) or p.business_id in (select id from kb)`,
+  crypto: `select 'crypto' rail, p.id, p.status, p.amount::float usd, p.created_at at, p.updated_at, p.blockchain who, b.name business, null why
+             from payments p join businesses b on b.id = p.business_id
+            where p.business_id in (select id from kb)`,
+  dispute: `select 'dispute' rail, d.id, d.status, d.amount / 100.0 usd, d.created_at at, d.updated_at, d.reason who, null business, null why
+              from stripe_disputes d where d.merchant_id in (select id from km)`,
+};
+const BUSINESSES = `select b.id, b.name, b.merchant_id, b.webhook_url, b.active, b.created_at from businesses b where b.id in (select id from kb)`;
+
+const SUCCESS = new Set(['completed', 'confirmed', 'forwarded', 'succeeded', 'captured', 'paid']);
+const FAILED = new Set(['failed', 'expired', 'canceled', 'cancelled', 'declined', 'duplicate', 'refunded', 'voided']);
+const bucket = (s) => (SUCCESS.has(s) ? 'completed' : FAILED.has(s) ? 'failed' : 'pending');
+
+// ---------------------------------------------------------------- bitcoin
+
+const mempool = async (path) => {
+  const r = await fetch(`https://mempool.space/api${path}`, { signal: AbortSignal.timeout(20_000) });
+  if (!r.ok) throw new Error(`mempool.space ${r.status} ${path}`);
+  return r.json();
+};
+
+/** Txs touching addr, newest first, back to `sinceSec` (plus anything unconfirmed). */
+async function btcTxs(addr, sinceSec) {
+  const out = [];
+  let last;
+  for (let page = 0; page < 20; page++) {
+    const t = await mempool(`/address/${addr}/txs${last ? `/chain/${last}` : ''}`);
+    if (!t.length) break;
+    out.push(...t);
+    const tail = t[t.length - 1];
+    if (!tail.status.confirmed) { last = undefined; continue; }
+    if (tail.status.block_time < sinceSec) break;
+    last = tail.txid;
+  }
+  const seen = new Set();
+  return out.filter((x) => !seen.has(x.txid) && seen.add(x.txid) && (!x.status.confirmed || x.status.block_time >= sinceSec)).map((x) => {
+    const inn = x.vout.filter((v) => v.scriptpubkey_address === addr).reduce((a, v) => a + v.value, 0);
+    const outv = x.vin.filter((v) => v.prevout?.scriptpubkey_address === addr).reduce((a, v) => a + v.prevout.value, 0);
+    return { txid: x.txid, addr, net: (inn - outv) / 1e8, confirmed: x.status.confirmed, at: x.status.block_time ? new Date(x.status.block_time * 1000) : new Date() };
+  });
+}
+const btcPrice = async () => (await mempool('/v1/prices')).USD;
+
+// ---------------------------------------------------------------- state
+
+function loadState() {
+  try { return JSON.parse(readFileSync(STATE_FILE, 'utf8')); } catch { return { rows: {}, btc: {}, businesses: {} }; }
+}
+function saveState(s) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(STATE_FILE + '.tmp', JSON.stringify(s));
+  execFileSync('mv', [STATE_FILE + '.tmp', STATE_FILE]);
+}
+
+// ---------------------------------------------------------------- tick
+
+async function tick() {
+  const seed = flag('--seed');
+  const st = loadState();
+  const events = [];
+  const calls = [];
+
+  const businesses = await sql(BUSINESSES);
+  for (const b of businesses) {
+    if (!st.businesses[b.id] && !seed) {
+      events.push(`NEW BUSINESS "${b.name}" (merchant ${b.merchant_id}, webhook ${b.webhook_url || 'none'}, ${b.active ? 'active' : 'inactive'})`);
+      calls.push([`biz-${b.id}`, `Kyle opened a new CoinPay business: ${b.name}`]);
+    }
+    st.businesses[b.id] = b.name;
+  }
+
+  // Only rows touched in the last day are compared, so the state stays small.
+  const recent = (q) => `select * from (${q}) r where r.updated_at > now() - interval '1 day' or r.at > now() - interval '1 day'`;
+  const rows = (await Promise.all(Object.values(RAILS).map((q) => sql(recent(q))))).flat();
+  for (const r of rows) {
+    const prev = st.rows[r.id];
+    if (prev === r.status) continue;
+    st.rows[r.id] = r.status;
+    if (seed) continue;
+    const what = r.rail === 'dispute' ? `DISPUTE ${r.status} (${r.who})` : `${r.rail} ${prev ? `${prev} -> ` : ''}${r.status.toUpperCase()}`;
+    events.push(`${what}: ${usd(r.usd)}${r.business ? ` · ${r.business}` : ''}${r.who && r.rail !== 'dispute' ? ` · ${r.who}` : ''}${r.why ? ` · ${r.why}` : ''}`);
+    if (r.rail === 'dispute' && !prev) calls.push([`dispute-${r.id}`, `New chargeback on Kyle's CoinPay account: ${usd(r.usd)}, ${r.who}`]);
+  }
+
+  let price;
+  for (const addr of BTC_WATCH) {
+    const txs = await btcTxs(addr, Math.floor(Date.now() / 1000) - 2 * 86400);
+    for (const t of txs) {
+      const key = `${t.txid}:${t.confirmed ? 1 : 0}`;
+      if (st.btc[key]) continue;
+      st.btc[key] = Date.now();
+      if (seed || (t.confirmed && st.btc[`${t.txid}:0`])) continue; // announced while unconfirmed already
+      price ??= await btcPrice().catch(() => 0);
+      const amt = Math.abs(t.net);
+      events.push(`btc ${t.net > 0 ? 'SALE IN' : 'cash-out'} ${amt.toFixed(8)} BTC${price ? ` (${usd(amt * price)})` : ''}${t.confirmed ? '' : ' · unconfirmed'} · ${addr.slice(0, 10)}… · https://mempool.space/tx/${t.txid}`);
+    }
+  }
+
+  // Prune: rows by recency are re-read daily anyway; btc keys older than 3 days go.
+  const cutoff = Date.now() - 3 * 86_400_000;
+  for (const [k, v] of Object.entries(st.btc)) if (v < cutoff) delete st.btc[k];
+  if (Object.keys(st.rows).length > 20_000) st.rows = Object.fromEntries(Object.entries(st.rows).slice(-10_000));
+  saveState(st);
+
+  if (seed) return console.log(`seeded: ${businesses.length} businesses, ${rows.length} recent rows, btc ${Object.keys(st.btc).length} txs`);
+  if (!events.length) return;
+  const sales = events.filter((e) => /SALE IN|COMPLETED|CONFIRMED|FORWARDED/.test(e)).length;
+  const subject = `Kyle: ${sales ? `${sales} new sale${sales > 1 ? 's' : ''}` : `${events.length} change${events.length > 1 ? 's' : ''}`} (${events[0].slice(0, 60)})`;
+  const text = `${events.join('\n')}\n\n${hostname()} · kyle-watch tick · ${new Date().toISOString()}`;
+  if (DRY) return console.log(`${subject}\n${text}`);
+  const id = await resend({ subject, text });
+  console.log(`sent ${id}: ${subject}`);
+  for (const [k, m] of calls) await alertCall(k, m);
+}
+
+// ---------------------------------------------------------------- daily
+
+async function siteStatus(host) {
+  for (const scheme of ['https', 'http']) {
+    try {
+      const r = await fetch(`${scheme}://${host}/`, { redirect: 'follow', signal: AbortSignal.timeout(20_000), headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/141 Safari/537.36' } });
+      const body = await r.text();
+      return { host, up: r.ok, code: r.status, scheme, title: (/<title>([^<]*)/i.exec(body) || [])[1]?.trim() };
+    } catch {}
+  }
+  return { host, up: false, code: 'timeout' };
+}
+
+async function daily() {
+  const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+  const PREV = addDays(DAY, -1);
+  const WEEK = Array.from({ length: 7 }, (_, i) => addDays(DAY, i - 6));
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name}: ${e.message.slice(0, 200)}`); return null; } };
+
+  const allRail = Object.values(RAILS).filter((q) => !q.includes("'dispute'")).map((q) => `(${q})`).join(' union all ');
+  const [byDay, lifetime, disputes, businesses, btc, price, sites] = await Promise.all([
+    settle('coinpay', () => sql(`select r.rail, r.status, r.at::date::text d, count(*)::int n, sum(r.usd)::float usd from (${allRail}) r
+                                  where r.at >= '${WEEK[0]}' and r.at < '${addDays(DAY, 1)}' group by 1,2,3`)),
+    settle('coinpay lifetime', () => sql(`select r.rail, r.status, count(*)::int n, sum(r.usd)::float usd, max(r.at) last from (${allRail}) r group by 1,2`)),
+    settle('disputes', () => sql(`select d.status, count(*)::int n, sum(d.usd)::float usd, max(d.at) last from (${RAILS.dispute}) d group by 1`)),
+    settle('businesses', () => sql(BUSINESSES)),
+    settle('bitcoin', async () => (await Promise.all(BTC_WATCH.map((a) => btcTxs(a, Date.parse(`${WEEK[0]}T00:00:00Z`) / 1000)))).flat()),
+    settle('btc price', btcPrice),
+    Promise.all(SITES.map(siteStatus)),
+  ]);
+
+  // Per day: completed / failed / pending counts and dollars across CoinPay rails, plus btc in/out.
+  const days = Object.fromEntries(WEEK.map((d) => [d, { completed: [0, 0], failed: [0, 0], pending: [0, 0], btcIn: [0, 0], btcOut: [0, 0] }]));
+  for (const r of byDay || []) { const c = days[r.d]?.[bucket(r.status)]; if (c) { c[0] += r.n; c[1] += r.usd || 0; } }
+  for (const t of btc || []) {
+    const d = isoDay(t.at);
+    if (!days[d] || !t.confirmed) continue;
+    const c = t.net > 0 ? days[d].btcIn : days[d].btcOut;
+    c[0] += 1; c[1] += Math.abs(t.net);
+  }
+  const today = days[DAY], prev = days[PREV] || { completed: [0, 0], failed: [0, 0], pending: [0, 0], btcIn: [0, 0], btcOut: [0, 0] };
+  const delta = (a, b) => (a === b ? '' : ` (${a > b ? '+' : ''}${(a - b).toLocaleString('en-US', { maximumFractionDigits: 2 })} vs day before)`);
+  const p = price || 0;
+
+  const lifeBy = {};
+  for (const r of lifetime || []) {
+    const k = `${r.rail} ${bucket(r.status)}`;
+    lifeBy[k] ??= { n: 0, usd: 0, last: null, statuses: [] };
+    Object.assign(lifeBy[k], { n: lifeBy[k].n + r.n, usd: lifeBy[k].usd + (r.usd || 0), last: !lifeBy[k].last || r.last > lifeBy[k].last ? r.last : lifeBy[k].last });
+    lifeBy[k].statuses.push(`${r.status} ${r.n}`);
+  }
+  const lastSale = (lifetime || []).filter((r) => SUCCESS.has(r.status)).map((r) => r.last).sort().pop();
+  const openDisputes = (disputes || []).filter((d) => !/won|lost|closed|charge_refunded/.test(d.status));
+
+  const lines = [
+    `Kyle watch · ${DAY} (UTC)`,
+    '',
+    `CoinPay sales: ${today.completed[0]} completed ${usd(today.completed[1])}${delta(today.completed[0], prev.completed[0])}`,
+    `CoinPay failed/expired: ${today.failed[0]} ${usd(today.failed[1])}${delta(today.failed[0], prev.failed[0])}`,
+    `CoinPay still pending: ${today.pending[0]} ${usd(today.pending[1])}`,
+    `BTC in (sales): ${today.btcIn[0]} tx, ${today.btcIn[1].toFixed(8)} BTC ${usd(today.btcIn[1] * p)}${delta(today.btcIn[0], prev.btcIn[0])}`,
+    `BTC out (cash-outs): ${today.btcOut[0]} tx, ${today.btcOut[1].toFixed(8)} BTC ${usd(today.btcOut[1] * p)}`,
+    `Last CoinPay sale ever: ${lastSale ? String(lastSale).slice(0, 16).replace('T', ' ') : 'none'}`,
+    `Open disputes: ${openDisputes.reduce((a, d) => a + d.n, 0)} ${usd(openDisputes.reduce((a, d) => a + (d.usd || 0), 0))}`,
+    '',
+    'Last 7 days (completed / failed / pending / btc in):',
+    ...WEEK.map((d) => `  ${d}  ${days[d].completed[0]} ${usd(days[d].completed[1])} / ${days[d].failed[0]} / ${days[d].pending[0]} / ${days[d].btcIn[0]} ${days[d].btcIn[1].toFixed(5)} BTC`),
+    '',
+    'Lifetime on CoinPay:',
+    ...Object.entries(lifeBy).sort().map(([k, v]) => `  ${k}: ${v.n} ${usd(v.usd)} (${v.statuses.join(', ')}), last ${String(v.last).slice(0, 10)}`),
+    ...(disputes || []).map((d) => `  disputes ${d.status}: ${d.n} ${usd(d.usd)}`),
+    '',
+    'Businesses:',
+    ...(businesses || []).map((b) => `  ${b.name} · ${b.active ? 'ACTIVE' : 'inactive'} · merchant ${b.merchant_id.slice(0, 8)} · ${b.webhook_url || 'no webhook'}`),
+    '',
+    'Sites:',
+    ...sites.map((s) => `  ${s.host}: ${s.up ? 'UP' : 'DOWN'} ${s.code}${s.title ? ` "${s.title}"` : ''}`),
+    ...(problems.length ? ['', 'Could not read:', ...problems.map((x) => `  ${x}`)] : []),
+    '',
+    `BTC at ${usd(p)} · CoinPay rails: card, paypal, crypto · btc = ${BTC_WATCH.join(', ')}`,
+  ];
+  const text = lines.join('\n');
+  const html = `<pre style="font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap">${esc(text)}</pre>`;
+  const subject = `Kyle ${DAY}: ${today.completed[0]} sales ${usd(today.completed[1])}, ${today.failed[0]} failed, ${today.btcIn[0]} btc in${openDisputes.length ? `, disputes open` : ''}`;
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify({ day: DAY, days, lifeBy, sites, problems }));
+  if (DRY) return console.log(`${subject}\n\n${text}`);
+  const id = await resend({ subject, text, html });
+  console.log(`sent ${id} to ${TO}: ${subject}`);
+}
+
+const main = CMD === 'tick' ? tick : CMD === 'daily' ? daily : null;
+if (!main) { console.error('usage: kyle-watch tick [--seed] | daily [--dry-run] [--day YYYY-MM-DD] [--to EMAIL]'); process.exit(2); }
+main().catch(async (e) => {
+  const msg = String(e?.stack || e);
+  console.error(`kyle-watch ${CMD}: ${msg}`);
+  if (!DRY && CMD === 'daily') await resend({ subject: 'Kyle watch daily FAILED', text: `${msg}\n\nHost: ${hostname()}` }).catch(() => {});
+  if (!DRY && CMD === 'tick') await run('alert', ['--key', 'kyle-watch-tick-broken', '--every', '12h', `kyle-watch tick is failing: ${e.message.slice(0, 120)}`]).catch(() => {});
+  process.exit(1);
+});
