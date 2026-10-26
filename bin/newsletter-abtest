@@ -77,6 +77,18 @@ function stats(id) {
   return JSON.parse(myna('newsletter', 'stats', id, '--json'));
 }
 
+/** False when myna newsletter tracking is switched off. Then there are no
+ * opens or clicks to count and `stats` fails for every issue, so the digest
+ * has nothing to say. Tracking went off on purpose on 2026-10-21: it rewrites
+ * every link through crawlproof.com, which is on the Spamhaus DBL. */
+function trackingOn() {
+  try {
+    return !/^tracking\s+off\b/m.test(myna('newsletter', 'track'));
+  } catch {
+    return true; // unknown: let stats() say what is wrong
+  }
+}
+
 // ---------------------------------------------------------------- statistics
 
 /** Standard normal tail, Abramowitz and Stegun 26.2.17; good to 7 decimals. */
@@ -557,6 +569,10 @@ async function main() {
   // Offline renders mail only when --to says where: a re-render of old
   // readings must never land in the real inbox by accident.
   const send = !quiet && (!OFFLINE || has('--to'));
+  if (!OFFLINE && !trackingOn()) {
+    console.log(`${new Date().toISOString()} myna newsletter tracking is off, so there are no opens or clicks to count; no digest. Turn it back on with: myna newsletter track set <trackingId>`);
+    return;
+  }
   let m, text, html;
   try {
     m = collect({ record: !has('--dry-run') && !OFFLINE });
