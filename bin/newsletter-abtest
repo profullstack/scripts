@@ -89,6 +89,77 @@ function trackingOn() {
   }
 }
 
+// ---------------------------------------------------------------- deliveries
+
+const DELIVERIES = join(DATA, 'deliveries.jsonl');
+const DAY_MS = 86_400_000;
+
+/** The daily cap every send is paced by (outreach.maxEmailsPerDay). */
+function dailyCap() {
+  try { return Number(myna('config', 'outreach.maxEmailsPerDay').trim()) || null; } catch { return null; }
+}
+
+/** Where every send stands, on every list, whatever its id: a one-off blast
+ * is mail to the same people, and it spends the same daily cap. This part
+ * needs no tracking, so it still reports while tracking is off. Each run
+ * appends a reading so "sent since the last report" is a real number. */
+function deliveries({ record }) {
+  const now = new Date().toISOString();
+  const all = JSON.parse(myna('newsletter', '--json'));
+  const last = new Map();
+  if (existsSync(DELIVERIES)) {
+    for (const l of readFileSync(DELIVERIES, 'utf8').split('\n').filter(Boolean)) {
+      try { const r = JSON.parse(l); last.set(r.id, r); } catch {}
+    }
+  }
+  const rows = [];
+  for (const n of all) {
+    if (n.status === 'draft') continue;
+    // A finished send drops out a week after it went, once nothing moves.
+    if (n.status === 'sent' && n.sentAt && Date.parse(now) - Date.parse(n.sentAt) > 7 * DAY_MS) continue;
+    let s;
+    try { s = JSON.parse(myna('newsletter', 'status', n.id, '--json')); } catch { continue; }
+    const before = last.get(n.id);
+    const since = before ? Math.max(0, s.sent - before.sent) : null;
+    const quietFor = s.lastSentAt ? Date.parse(now) - Date.parse(s.lastSentAt) : Infinity;
+    const state = s.remaining === 0 ? 'done'
+      : s.running ? 'sending'
+      : n.status === 'scheduled' ? 'scheduled'
+      : quietFor > DAY_MS ? 'stalled' : 'waiting';
+    rows.push({
+      id: n.id, list: n.list, subject: n.subject, status: n.status, state,
+      audience: s.audience, sent: s.sent, failed: s.failed, remaining: s.remaining,
+      since, lastSentAt: s.lastSentAt, scheduledFor: n.scheduledFor || null,
+      etaMs: s.running ? s.etaMs : null,
+    });
+  }
+  if (record && rows.length) {
+    appendFileSync(DELIVERIES, rows.map((r) => JSON.stringify({ at: now, id: r.id, sent: r.sent, failed: r.failed })).join('\n') + '\n');
+  }
+  const cap = dailyCap();
+  const remaining = rows.reduce((t, r) => t + r.remaining, 0);
+  const sentSince = rows.reduce((t, r) => t + (r.since || 0), 0);
+  return { now, cap, rows, remaining, sentSince, days: cap ? Math.ceil(remaining / cap) : null };
+}
+
+function renderDeliveries(d) {
+  const lines = [];
+  lines.push(`Deliveries, every list (daily cap ${d.cap ? num(d.cap) : 'unknown'})`);
+  lines.push(`  ${num(d.sentSince)} sent since the last report; ${num(d.remaining)} still to go` +
+    (d.remaining && d.days ? `, about ${d.days} day${d.days === 1 ? '' : 's'} at the cap` : ''));
+  for (const r of d.rows) {
+    const when = r.state === 'sending' && r.etaMs ? `, done about ${new Date(Date.parse(d.now) + r.etaMs).toISOString().slice(11, 16)} UTC`
+      : r.state === 'scheduled' && r.scheduledFor ? `, at ${r.scheduledFor.slice(0, 16).replace('T', ' ')} UTC`
+      : r.state === 'stalled' ? `, nothing since ${r.lastSentAt ? r.lastSentAt.slice(0, 16).replace('T', ' ') : 'the start'}: run myna newsletter blast --go ${r.id}`
+      : '';
+    lines.push(`  ${r.id}  [${r.state}]  ${r.list}`);
+    lines.push(`    ${num(r.sent)} of ${num(r.audience)} sent${r.failed ? `, ${num(r.failed)} failed` : ''}` +
+      `${r.since != null ? ` (${plus(r.since)} since last)` : ''}${when}`);
+  }
+  if (!d.rows.length) lines.push('  Nothing sent or sending in the last week.');
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------- statistics
 
 /** Standard normal tail, Abramowitz and Stegun 26.2.17; good to 7 decimals. */
@@ -569,8 +640,23 @@ async function main() {
   // Offline renders mail only when --to says where: a re-render of old
   // readings must never land in the real inbox by accident.
   const send = !quiet && (!OFFLINE || has('--to'));
+  // Tracking off (on purpose since 2026-10-21) used to mean no mail at all,
+  // which hid every send for days. Deliveries still get reported.
   if (!OFFLINE && !trackingOn()) {
-    console.log(`${new Date().toISOString()} myna newsletter tracking is off, so there are no opens or clicks to count; no digest. Turn it back on with: myna newsletter track set <trackingId>`);
+    let text;
+    try {
+      const d = deliveries({ record: !has('--dry-run') });
+      text = `${renderDeliveries(d)}\n\nNo opens or clicks: myna newsletter tracking is off. Turn it back on with: myna newsletter track set <trackingId>`;
+      const stalled = d.rows.filter((r) => r.state === 'stalled').length;
+      const subject = `Newsletter: ${num(d.sentSince)} sent, ${num(d.remaining)} to go${stalled ? `, ${stalled} stalled` : ''}`;
+      if (send) await mail(subject, text);
+    } catch (e) {
+      const report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
+      if (send) await mail('Newsletter: the delivery report failed', report);
+      console.error(report);
+      process.exit(1);
+    }
+    console.log(text);
     return;
   }
   let m, text, html;
@@ -578,6 +664,11 @@ async function main() {
     m = collect({ record: !has('--dry-run') && !OFFLINE });
     text = renderText(m);
     html = renderHtml(m);
+    if (!OFFLINE) {
+      const d = renderDeliveries(deliveries({ record: !has('--dry-run') }));
+      text += `\n\n${d}`;
+      html += `<div style="max-width:640px;margin:0 auto;padding:0 16px">${preHtml(d)}</div>`;
+    }
   } catch (e) {
     const report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
     if (send) await mail('Newsletter A/B: the digest failed', report);
