@@ -1,0 +1,590 @@
+#!/usr/bin/env node
+// w3bs-nightly — one email a night: how many people installed W3BS yesterday, how
+// many ran the w3bs CLI, who came to w3bs.org, and what they did with an account
+// (sign-ups, CLI logins, fleet machines, publishing, Social and the board).
+// Our own boxes, CI runners, crawlers and accounts are taken out everywhere.
+//
+//   w3bs-nightly                    send the report for yesterday (UTC)
+//   w3bs-nightly --dry-run          build it, write it under the data dir, send nothing
+//   w3bs-nightly --day 2026-10-25   report a specific UTC day (installs and CLI need the
+//                                   nginx logs, which dev2 keeps for ~2 days)
+//   w3bs-nightly --to a@b.com,c@d   someone else (default anthony@ + preshy@profullstack.com)
+//
+// Sources, each of which may fail on its own and is then named in the email:
+//   nginx    dev2's shared access log, w3bs.org and its subdomains:
+//            installs = GET install.sh / install.ps1 (root, desktop/, de/, training/)
+//            from outside IPs; the package scanner, our boxes and private ranges are
+//            left out. CLI = requests whose user agent is w3bs/<version> (update
+//            checks, package fetches, OS channel, login); IPs inside GitHub's
+//            published Actions ranges (api.github.com/meta) are counted as CI, apart.
+//            browse.w3bs.org /i/<publisher>/<pkg> with a w3bs referer are "install this" clicks.
+//   accounts the w3bs.org Postgres on dev2 (users, sessions, events, oauth_tokens,
+//            fleet_*, package_releases, resources, pub_tasks, ab_*), read-only.
+//   social   the Social PDS sqlite (accounts, repo writes) and the board's
+//            tsbb.db (users, topics, posts), both opened read-only.
+//   traffic  CrawlProof tracker rollups of the w3bs.org project, found by url.
+// Secrets: RESEND_API_KEY and CRAWLPROOF_DB_URL from the team vault fleet-nightly--prod.
+// The w3bs.org DB URL is the dev2 fleet kit state (~/.local/state/dev2-fleet/w3bs.org.json).
+
+import { execFile, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  join(homedir(), '.bun/bin'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+  process.env.PATH || '',
+].join(':');
+
+const DATA_DIR = process.env.W3BS_NIGHTLY_DATA || join(homedir(), '.local/share/w3bs-nightly');
+const STATE = join(process.env.DEV2_FLEET_STATE || join(homedir(), '.local/state/dev2-fleet'), 'w3bs.org.json');
+const PDS_DIR = process.env.W3BS_PDS_DIR || join(homedir(), 'www/w3bs.org-social/volumes/pds');
+const BBS_DB = process.env.W3BS_BBS_DB || join(homedir(), 'www/w3bs.org-bbs/volumes/data/tsbb.db');
+const SITE = 'w3bs.org';
+const DEFAULT_FROM = 'W3BS nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'anthony@profullstack.com,preshy@profullstack.com';
+// Our own egress: dev1 (v4 + v6), dev2, and the boxes enrolled in our fleet (vienna,
+// seed1, dev3, bonita, dev1.w3bs.org), plus docker/wireguard/private ranges.
+const OUR_IPS = (process.env.W3BS_OUR_IPS ||
+  '67.205.189.229,2604:a880:400:d1:0:4:c3fe:1,23.95.228.174,152.53.47.37,104.152.209.195,172.12.140.170,2.56.246.141,2.56.246.142').split(',');
+const OURS = (ip) => OUR_IPS.includes(ip) || /^(10\.|127\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|::1$|fd)/.test(ip);
+// Accounts that are us or our tests (riotcoder@ is @profullstack.com). Postgres regex syntax.
+const INTERNAL = '@(profullstack\\.com|w3bs\\.org|chovy\\.com|example\\.com|mailinator\\.com)$|^ettinger@gmail\\.com$|^riotcoder|^qa[.+-]|\\+qa@';
+const INTERNAL_RE = new RegExp(INTERNAL, 'i');
+const INTERNAL_NAMES = /^(profullstack|riotcoder|anthony|qa[-_.].*)$/i;
+const SCRIPTS = ['install.sh', 'desktop/install.sh', 'de/install.sh', 'training/install.sh'];
+const STRIP_DAYS = 7;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = (opt('--to') || process.env.W3BS_REPORT_TO || DEFAULT_TO).split(',').map((s) => s.trim()).filter(Boolean);
+const FROM = process.env.W3BS_REPORT_FROM || DEFAULT_FROM;
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(DAY, i - STRIP_DAYS + 1));
+const FROM7 = addDays(DAY, -6), FROM30 = addDays(DAY, -29);
+const END = Date.parse(`${addDays(DAY, 1)}T00:00:00Z`); // end of the reported day
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  const p = execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000, env: { ...process.env, ...opts.env } }, (err, out, errOut) =>
+    err ? reject(new Error(`${cmd}: ${(errOut || err.message).trim().split('\n').slice(-3).join(' ')}`)) : resolve(out));
+  if (opts.input) { p.stdin.end(opts.input); }
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+let vaultCache;
+function vault() {
+  if (vaultCache) return vaultCache;
+  vaultCache = {};
+  const dir = mkdtempSync(join(tmpdir(), 'w3bs-nightly-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    vaultCache = parseEnv(readFileSync(join(dir, 'env'), 'utf8'));
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  return vaultCache;
+}
+const secret = (k) => process.env[k] || vault()[k];
+
+function resendKey() {
+  const k = secret('RESEND_API_KEY');
+  if (k) return k;
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+/** Named read-only queries against one Postgres, through Bun's client. */
+async function pg(url, queries) {
+  const script = `
+    import { SQL } from "bun";
+    const sql = new SQL(process.env.DBURL);
+    await sql.unsafe("set session characteristics as transaction read only");
+    const [ro] = await sql.unsafe("show transaction_read_only");
+    if (ro.transaction_read_only !== "on") throw new Error("not read-only");
+    const qs = JSON.parse(process.env.QUERIES), out = {};
+    for (const [k, q] of Object.entries(qs)) out[k] = await sql.unsafe(q.sql, q.params || []);
+    console.log(JSON.stringify(out));
+    await sql.close();`;
+  // The app's URL says sslmode=no-verify (node-postgres); Bun only knows require.
+  const out = await run('bun', ['-e', script], { env: { DBURL: url.replace(/sslmode=no-verify/, 'sslmode=require'), QUERIES: JSON.stringify(queries) }, timeout: 90_000 });
+  return JSON.parse(out.trim().split('\n').pop());
+}
+
+/** Named queries against sqlite files opened read-only: { name: [file, sql, ...params] }. */
+async function sqlite(queries) {
+  const script = `
+    import { Database } from "bun:sqlite";
+    const qs = JSON.parse(process.env.QUERIES), dbs = {}, out = {};
+    for (const [k, [file, q, ...params]] of Object.entries(qs)) {
+      dbs[file] ||= new Database(file, { readonly: true });
+      out[k] = dbs[file].query(q).all(...params);
+    }
+    console.log(JSON.stringify(out));`;
+  const out = await run('bun', ['-e', script], { env: { QUERIES: JSON.stringify(queries) } });
+  return JSON.parse(out.trim().split('\n').pop());
+}
+
+const dayOf = (t) => (t ? new Date(typeof t === 'number' ? t : t).toISOString().slice(0, 10) : null);
+const sum = (xs, f = (x) => x) => xs.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+const hashIp = (ip) => createHash('sha256').update(`w3bs-nightly:${ip}`).digest('hex').slice(0, 16);
+
+// ---------------------------------------------------------------- sources
+
+/** GitHub Actions runner ranges (IPv4), so CI fetching the CLI is not counted as people. */
+async function actionsRanges() {
+  const j = JSON.parse(await run('gh', ['api', 'meta']));
+  const ip2n = (ip) => ip.split('.').reduce((a, x) => a * 256 + Number(x), 0);
+  const nets = (j.actions || []).filter((c) => c.includes('.')).map((c) => {
+    const [b, m] = c.split('/'); const size = 2 ** (32 - Number(m)); const s = Math.floor(ip2n(b) / size) * size;
+    return [s, s + size];
+  });
+  return (ip) => ip.includes('.') && nets.some(([a, b]) => ip2n(ip) >= a && ip2n(ip) < b);
+}
+
+/** Installs, CLI requests and install clicks for one UTC day from dev2's shared nginx log; IPs leave only as hashes. */
+async function nginx() {
+  const [y, , d] = DAY.split('-');
+  const mon = new Date(`${DAY}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', timeZone: 'UTC' });
+  const stamp = `${d}/${mon}/${y}`;
+  // One record per request we care about: "<kind> <ip> <detail>". Fields split on '"':
+  // $1 = host ip - - [time], $2 = request line, $3 = status bytes, $6 = user agent.
+  const remote = `cd /var/log/nginx && { cat access.log access.log.1 2>/dev/null; zcat access.log.*.gz 2>/dev/null; } | ` +
+    `awk -F'"' -v s='[${stamp}:' 'index($1, s) { split($1, h, " "); if (h[1] !~ /(^|\\.)w3bs\\.org$/) next; ` +
+    `split($2, r, " "); p = r[2]; sub(/\\?.*/, "", p); split($3, st, " "); ua = $6; lua = tolower(ua); ` +
+    `if (ua ~ /^w3bs\\//) { split(ua, v, "[/ ]"); a = "other"; ` +
+    `  if (p ~ /^\\/repo\\/metadata/) a = "check"; else if (p ~ /^\\/repo\\/targets/) a = "fetch"; else if (p ~ /^\\/os\\//) a = "os"; ` +
+    `  else if (p ~ /^\\/(oauth|api\\/auth|api\\/me)/) a = "login"; else if (p ~ /^\\/api\\/fleet/) a = "fleet"; else if (p ~ /install\\.(sh|ps1)$/) a = "install"; ` +
+    `  print "cli", h[2], v[2] "|" a; next } ` +
+    `if (lua ~ /bot|crawl|spider|slurp|preview|gatus|uptime|monitor|headless|python-requests|go-http|scanner|w3bs-browse|crawlproof|wp-admin|semrush|ahrefs/) { print "bot", h[2], "-"; next } ` +
+    `if (h[1] ~ /^(www\\.)?w3bs\\.org$/ && (r[1] == "GET" || r[1] == "HEAD") && st[1] ~ /^2/ && p ~ /^\\/((desktop|de|training)\\/)?install\\.(sh|ps1)$/) { print "inst", h[2], substr(p, 2); next } ` +
+    // A click comes from a w3bs page; refererless /i/ hits with browser agents are scrapers.
+    `if (h[1] == "browse.w3bs.org" && r[1] == "GET" && p ~ /^\\/i\\// && $4 ~ /^https:\\/\\/([a-z0-9-]+\\.)?w3bs\\.org\\//) { print "click", h[2], substr(p, 4) } }' | sort | uniq -c; ` +
+    `echo "OLDEST $(ls -tr access.log.*.gz 2>/dev/null | head -1 | xargs -r zcat 2>/dev/null | head -1 | grep -oE '\\[[^]]+\\]')"`;
+  const local = hostname().startsWith('dev2');
+  const [out, isCi] = await Promise.all([
+    local ? run('bash', ['-s'], { input: remote, timeout: 300_000 })
+      : run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', 'dev2', 'bash', '-s'], { input: remote, timeout: 300_000 }),
+    actionsRanges().catch(() => null),
+  ]);
+  let oldest = null; const rows = [];
+  for (const line of out.split('\n')) {
+    if (line.startsWith('OLDEST ')) { oldest = line.slice(7); continue; }
+    const m = /^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S+)$/.exec(line);
+    if (m) rows.push({ kind: m[2], ip: m[3], detail: m[4], hits: +m[1] });
+  }
+  const outside = rows.filter((x) => !OURS(x.ip));
+  const uniq = (xs) => [...new Set(xs.map((x) => x.ip))];
+
+  const inst = outside.filter((x) => x.kind === 'inst');
+  const installers = uniq(inst);
+  const scripts = Object.fromEntries(SCRIPTS.map((s) => [s, uniq(inst.filter((x) => x.detail === s || x.detail === s.replace(/\.sh$/, '.ps1'))).length]));
+  const ps1 = uniq(inst.filter((x) => x.detail.endsWith('.ps1'))).length;
+
+  const cliAll = outside.filter((x) => x.kind === 'cli');
+  const ci = cliAll.filter((x) => isCi && isCi(x.ip));
+  const cli = cliAll.filter((x) => !(isCi && isCi(x.ip)));
+  const cliUsers = uniq(cli);
+  const versions = {};
+  for (const ip of cliUsers) {
+    // An IP that ran two versions that day counts for the newest.
+    const v = cli.filter((x) => x.ip === ip).map((x) => x.detail.split('|')[0]).sort((a, b) => a.localeCompare(b, 'en', { numeric: true })).pop();
+    versions[v] = (versions[v] || 0) + 1;
+  }
+  const actions = {};
+  for (const x of cli) { const a = x.detail.split('|')[1]; actions[a] = actions[a] || new Set(); actions[a].add(x.ip); }
+
+  const clicks = outside.filter((x) => x.kind === 'click');
+  const clickPkgs = Object.entries(clicks.reduce((a, x) => ((a[x.detail] = (a[x.detail] || new Set()).add(x.ip)), a), {}))
+    .map(([k, v]) => [k, v.size]).sort((a, b) => b[1] - a[1]);
+
+  const t = /\[(\d+)\/(\w+)\/(\d+):(\d+:\d+:\d+)/.exec(oldest || '');
+  const complete = !t || Date.parse(`${t[1]} ${t[2]} ${t[3]} ${t[4]} UTC`) <= Date.parse(`${DAY}T00:00:00Z`);
+  return {
+    installs: installers.length, scripts, ps1, fetches: sum(inst, (x) => x.hits),
+    installerHashes: installers.map(hashIp),
+    cliUsers: cliUsers.length, cliRequests: sum(cli, (x) => x.hits), cliHashes: cliUsers.map(hashIp),
+    versions: Object.entries(versions).sort((a, b) => b[0].localeCompare(a[0], 'en', { numeric: true })),
+    actions: Object.fromEntries(Object.entries(actions).map(([k, v]) => [k, v.size])),
+    ciIps: uniq(ci).length, ciRequests: sum(ci, (x) => x.hits), ciKnown: !!isCi,
+    clickUsers: uniq(clicks).length, clicks: sum(clicks, (x) => x.hits), clickPkgs: clickPkgs.slice(0, 6),
+    bots: sum(rows.filter((x) => x.kind === 'bot'), (x) => x.hits),
+    ours: new Set(rows.filter((x) => OURS(x.ip)).map((x) => x.ip)).size,
+    complete, oldest,
+  };
+}
+
+/** w3bs.org accounts and what they did. Emails never leave the queries. */
+async function accounts() {
+  const url = JSON.parse(readFileSync(STATE, 'utf8')).database_url;
+  const db = await pg(url, {
+    users: { sql: `select id, substr(created_at, 1, 10) d, (coalesce(email, '') ~* $1 or username ~* '^(qa-|riotcoder)') internal from users`, params: [INTERNAL] },
+    logins: { sql: `select s.user_id, substr(s.created_at, 1, 10) d from sessions s where substr(s.created_at, 1, 10) >= $1`, params: [FROM30] },
+    tokens: { sql: `select user_id, client_id, substr(min(created_at), 1, 10) d from oauth_tokens group by family, user_id, client_id` },
+    events: { sql: `select name, user_id, substr(at, 1, 10) d from events` },
+    machines: { sql: `select user_id, substr(created_at, 1, 10) d, last_seen_at from fleet_machines` },
+    actions: { sql: `select a.user_id, a.status, a.action from fleet_actions a where substr(a.created_at, 1, 10) = $1`, params: [DAY] },
+    releases: { sql: `select r.user_id, p.publisher, substr(r.created_at, 1, 10) d from package_releases r left join packages p on p.id = r.package_id` },
+    packages: { sql: `select kind, count(*)::int n from packages group by 1 order by 2 desc` },
+    resources: { sql: `select substr(published_at, 1, 10) d, count(*)::int n from resources group by 1` },
+    tasks: { sql: `select 'task' k, user_id, substr(published_at, 1, 10) d from pub_tasks union all select 'workflow', user_id, substr(created_at, 1, 10) from pub_workflows` },
+    keys: { sql: `select user_id, substr(created_at, 1, 10) d from publisher_keys where revoked_at is null` },
+    ab: { sql: `select (select count(*)::int from ab_experiments) experiments, (select count(*)::int from ab_events where substr(at, 1, 10) = $1) events`, params: [DAY] },
+  });
+  const ours = new Set(db.users.filter((u) => u.internal).map((u) => u.id));
+  const out = (xs) => xs.filter((x) => !ours.has(x.user_id));
+  const cliTokens = db.tokens.filter((t) => t.client_id === 'w3bs-cli');
+  const perDay = (d) => ({
+    signups: db.users.filter((u) => !u.internal && u.d === d).length,
+    logins: new Set(out(db.logins).filter((x) => x.d === d).map((x) => x.user_id)).size,
+    cliLogins: new Set(out(cliTokens).filter((x) => x.d === d).map((x) => x.user_id)).size,
+  });
+  const ev = out(db.events);
+  const eventsDay = Object.entries(ev.filter((e) => e.d === DAY).reduce((a, e) => ((a[e.name] = (a[e.name] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]);
+  const seen24 = (m) => m.last_seen_at && Date.parse(m.last_seen_at) > END - 86_400_000 && Date.parse(m.last_seen_at) <= END + 6 * 3_600_000;
+  const rel = db.releases;
+  return {
+    total: db.users.length, external: db.users.length - ours.size, internal: ours.size,
+    new7: db.users.filter((u) => !u.internal && u.d >= FROM7 && u.d <= DAY).length,
+    new30: db.users.filter((u) => !u.internal && u.d >= FROM30 && u.d <= DAY).length,
+    lastSignup: db.users.filter((u) => !u.internal).map((u) => u.d).sort().pop() || null,
+    days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, perDay(d)])),
+    active30: new Set(out(db.logins).map((x) => x.user_id)).size,
+    cliLoginsAll: new Set(out(cliTokens).map((x) => x.user_id)).size,
+    eventsDay, eventsAll: ev.length,
+    machines: {
+      total: db.machines.length, outside: out(db.machines).length,
+      seen: db.machines.filter(seen24).length, outsideSeen: out(db.machines).filter(seen24).length,
+      newDay: db.machines.filter((m) => m.d === DAY).length, outsideNew: out(db.machines).filter((m) => m.d === DAY).length,
+    },
+    fleetActions: {
+      total: db.actions.length, outside: out(db.actions).length,
+      failed: db.actions.filter((a) => /fail|error/.test(a.status || '')).length,
+      byAction: Object.entries(db.actions.reduce((a, x) => ((a[x.action] = (a[x.action] || 0) + 1), a), {})),
+    },
+    publish: {
+      releasesDay: rel.filter((r) => r.d === DAY).length, releasesOutsideDay: out(rel).filter((r) => r.d === DAY).length,
+      releasesAll: rel.length, outsidePublishers: new Set(out(rel).map((r) => r.publisher)).size,
+      resourcesDay: db.resources.find((r) => r.d === DAY)?.n || 0, resourcesAll: sum(db.resources, (r) => r.n),
+      tasksDay: db.tasks.filter((t) => t.d === DAY).length, tasksAll: db.tasks.length, tasksOutside: out(db.tasks).length,
+      keysOutside: out(db.keys).length, keysDay: db.keys.filter((k) => k.d === DAY).length,
+      packages: db.packages,
+    },
+    ab: db.ab[0],
+  };
+}
+
+/** The Social PDS (accounts, repo writes) and the board (users, topics, posts). */
+async function community() {
+  const s0 = Date.parse(`${DAY}T00:00:00Z`), s1 = END;
+  const acct = join(PDS_DIR, 'account.sqlite'), seq = join(PDS_DIR, 'sequencer.sqlite');
+  const db = await sqlite({
+    actors: [acct, `select a.did, a.handle, a.createdAt c, coalesce(b.email, '') email from actor a left join account b on b.did = a.did where a.deactivatedAt is null and a.takedownRef is null`],
+    writes: [seq, `select did, count(*) n from repo_seq where eventType = 'append' and sequencedAt >= ? and sequencedAt < ? group by did`, `${DAY}T00:00:00`, `${addDays(DAY, 1)}T00:00:00`],
+    bbsUsers: [BBS_DB, `select id, username, coalesce(email_lower, '') email, created_at c, last_seen_at s from users where not is_deleted`],
+    bbsTopics: [BBS_DB, `select user_id, created_at c from topics where not is_deleted and created_at >= ? and created_at < ?`, s0, s1],
+    bbsPosts: [BBS_DB, `select user_id, created_at c from posts where not is_deleted and created_at >= ? and created_at < ?`, s0, s1],
+    bbsCounts: [BBS_DB, `select (select count(*) from topics where not is_deleted) topics, (select count(*) from posts where not is_deleted) posts`],
+  });
+  const internalActor = (a) => INTERNAL_RE.test(a.email) || INTERNAL_NAMES.test(a.handle.split('.')[0]);
+  const oursDid = new Set(db.actors.filter(internalActor).map((a) => a.did));
+  const outsideActors = db.actors.filter((a) => !oursDid.has(a.did));
+  const bbsOurs = new Set(db.bbsUsers.filter((u) => INTERNAL_RE.test(u.email) || INTERNAL_NAMES.test(u.username)).map((u) => u.id));
+  const bbsOut = db.bbsUsers.filter((u) => !bbsOurs.has(u.id));
+  return {
+    social: {
+      accounts: db.actors.length, outside: outsideActors.length,
+      newDay: outsideActors.filter((a) => dayOf(a.c) === DAY).length,
+      writes: sum(db.writes, (w) => w.n), outsideWrites: sum(db.writes.filter((w) => !oursDid.has(w.did)), (w) => w.n),
+      writers: db.writes.filter((w) => !oursDid.has(w.did)).length,
+    },
+    bbs: {
+      users: db.bbsUsers.length, outside: bbsOut.length,
+      newDay: bbsOut.filter((u) => dayOf(u.c) === DAY).length,
+      seenDay: bbsOut.filter((u) => u.s && u.s >= s0 && u.s < s1).length,
+      topicsDay: db.bbsTopics.length, postsDay: db.bbsPosts.length,
+      outsidePostsDay: db.bbsPosts.filter((p) => !bbsOurs.has(p.user_id)).length + db.bbsTopics.filter((p) => !bbsOurs.has(p.user_id)).length,
+      topics: db.bbsCounts[0].topics, posts: db.bbsCounts[0].posts,
+    },
+  };
+}
+
+/** Human traffic on w3bs.org from the CrawlProof tracker rollups. */
+async function traffic() {
+  const url = secret('CRAWLPROOF_DB_URL');
+  if (!url) throw new Error('no CRAWLPROOF_DB_URL');
+  const host = SITE.replace(/\./g, '\\.');
+  const proj = await pg(url, { p: { sql: `select id::text id from projects where url ~* $1 and archived_at is null order by tracker_enabled desc nulls last, created_at limit 1`, params: [`^https?://(www\\.)?${host}(/|$)`] } });
+  const id = proj.p[0]?.id;
+  if (!id) throw new Error(`no tracker project for ${SITE}`);
+  const from = addDays(FROM30, -1);
+  const db = await pg(url, {
+    ev: { sql: `select day::text d, event, page_path p, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1, 2, 3`, params: [id, from, DAY] },
+    vis: { sql: `select day::text d, count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1`, params: [id, from, DAY] },
+    v30: { sql: `select count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3`, params: [id, FROM30, DAY] },
+    refs: { sql: `select coalesce(nullif(referrer_host, ''), 'direct') h, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and event = 'pageview' and day = $2
+        and coalesce(referrer_host, '') !~* '(^|\\.)w3bs\\.org$' group by 1 order by 2 desc limit 6`, params: [id, DAY] },
+  });
+  const pv = (d) => sum(db.ev.filter((r) => r.d === d && r.event === 'pageview'), (r) => r.n);
+  const per = (d) => ({
+    visitors: db.vis.find((r) => r.d === d)?.v ?? 0,
+    views: pv(d),
+    signupSubmits: sum(db.ev.filter((r) => r.d === d && r.event === 'form_submit' && /^\/(signup|login)/.test(r.p || '')), (r) => r.n),
+  });
+  const top = Object.entries(db.ev.filter((r) => r.d === DAY && r.event === 'pageview').reduce((a, r) => ((a[r.p] = (a[r.p] || 0) + r.n), a), {}))
+    .sort((a, b) => b[1] - a[1]).slice(0, 8);
+  return { project: id, days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])), visitors30: db.v30[0]?.v ?? 0, top, refs: db.refs };
+}
+
+// ---------------------------------------------------------------- history
+
+function history() {
+  const dir = join(DATA_DIR, 'days');
+  const out = {};
+  if (existsSync(dir)) for (const f of readdirSync(dir)) if (f.endsWith('.json')) {
+    try { out[f.slice(0, 10)] = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch {}
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- render
+
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6';
+const n = (v) => (v === null || v === undefined ? '·' : Number(v).toLocaleString('en-US'));
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const signed = (d) => (d > 0 ? `+${n(d)}` : d < 0 ? `-${n(-d)}` : '±0');
+const plural = (k, word) => `${n(k)} ${word}${k === 1 ? '' : 's'}`;
+const list = (xs) => (xs.length ? xs.map(([k, v]) => `${esc(k)} ${n(v)}`).join(' · ') : 'none');
+
+function verdict(r) {
+  const parts = [];
+  const c = r.nginx, a = r.accounts, t = r.traffic;
+  if (c) parts.push(`${plural(c.installs, 'outside install')} and ${plural(c.cliUsers, 'outside CLI user')}${c.ciIps ? ` (plus ${n(c.ciIps)} CI runners)` : ''}.`);
+  if (t) parts.push(`${n(t.days[DAY].visitors)} people on w3bs.org (${n(t.visitors30)} in 30 days).`);
+  if (a) parts.push(`${plural(a.external, 'account')} that are not us (${n(a.internal)} are ours or QA), ${n(a.new30)} new in 30 days; last outside signup ${a.lastSignup ? dayLabel(a.lastSignup, true) : 'never'}.`);
+  return parts.join(' ') || 'No source answered tonight.';
+}
+
+function renderHtml(r, meta) {
+  const tile = (label, cur, prev, sub) => `<td style="width:25%;background:#f4f4f2;border-radius:8px;padding:10px 12px;vertical-align:top">
+<div style="font-size:12px;color:${MUTE}">${label}</div>
+<div style="font-size:24px;font-weight:700;margin-top:2px">${n(cur)}</div>
+<div style="font-size:12px;color:${prev === null || prev === undefined || cur === null ? MUTE : cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev === null || prev === undefined || cur === null ? '&nbsp;' : `${signed(cur - prev)} vs ${esc(dayLabel(PREV))}`}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:4px">${sub}</div></td>`;
+  const row = (k, v) => `<tr><td style="padding:6px 8px 6px 0;border-bottom:1px solid ${LINE};color:${MUTE};vertical-align:top">${k}</td><td style="padding:6px 0;border-bottom:1px solid ${LINE};text-align:right">${v}</td></tr>`;
+  const section = (title, rows) => `<div style="font-size:15px;font-weight:700;margin:20px 0 4px">${title}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">${rows.filter(Boolean).join('\n')}</table>`;
+
+  const c = r.nginx, a = r.accounts, t = r.traffic, s = r.community?.social, b = r.community?.bbs;
+  const d = a?.days[DAY], td = t?.days[DAY];
+  const max = Math.max(1, ...DAYS.map((x) => t?.days[x]?.visitors || 0));
+  const bars = DAYS.map((x) => {
+    const v = t?.days[x]?.visitors ?? 0, h = r.series[x] || {}, ad = a?.days[x];
+    const w = Math.max(v ? 2 : 0, Math.round((v / max) * 100));
+    return `<tr><td style="font-size:12px;color:${x === DAY ? INK : MUTE};padding:2px 8px 2px 0;white-space:nowrap;width:90px">${esc(dayLabel(x))}</td>
+<td style="padding:2px 0"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>${w ? `<td style="width:${w}%;background:${x === DAY ? BLUE : '#9dbfee'};height:10px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` : ''}<td style="font-size:0">&nbsp;</td></tr></table></td>
+<td style="font-size:12px;text-align:right;padding-left:8px;white-space:nowrap;width:280px">${t ? `${n(v)} visitors` : ''}${h.installs !== undefined ? ` · ${n(h.installs)} inst · ${n(h.cliUsers)} cli` : ' · <span style="color:#c9c8c2">no log</span>'}${ad ? ` · ${n(ad.signups)} signups` : ''}</td></tr>`;
+  }).join('');
+
+  const scripts = c ? Object.entries(c.scripts).map(([k, v]) => `${esc(k.replace('/install.sh', '').replace('install.sh', 'w3bs'))} ${n(v)}`).join(' · ') : '';
+  const cliActions = c ? Object.entries(c.actions).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${esc({ check: 'update check', fetch: 'package fetch', os: 'OS channel', login: 'login', fleet: 'fleet', install: 'installer', other: 'other' }[k] || k)} ${n(v)}`).join(' · ') : '';
+  const p = a?.publish;
+
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">W3BS nightly · ${esc(dayLabel(DAY, true))}</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">UTC day · our boxes, CI, crawlers and test accounts excluded · compared with ${esc(dayLabel(PREV))}</div>
+<div style="font-size:14px;margin-top:12px;padding:10px 12px;border-left:3px solid ${BLUE};background:#eef3fb">${esc(verdict(r))}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:14px -6px 0;border-collapse:separate"><tr>
+${tile('Installs', c ? c.installs : null, r.series[PREV]?.installs ?? null, c ? `unique outside IPs on the install scripts${c.complete ? '' : ' · log incomplete'}${r.newInstallers !== null ? ` · ${n(r.newInstallers)} never seen before` : ''}` : 'nginx log unreadable')}
+${tile('CLI users', c ? c.cliUsers : null, r.series[PREV]?.cliUsers ?? null, c ? `unique outside IPs running w3bs${r.newCli !== null ? ` · ${n(r.newCli)} new` : ''}${c.ciKnown ? '' : ' · CI ranges unknown'}` : 'nginx log unreadable')}
+${tile('Visitors', td ? td.visitors : null, t ? t.days[PREV].visitors : null, t ? `humans on w3bs.org · ${n(td.views)} page views` : 'tracker unreadable')}
+${tile('New accounts', d ? d.signups + (s?.newDay || 0) + (b?.newDay || 0) : null, a ? a.days[PREV].signups : null, a ? `w3bs.org ${n(d.signups)} · Social ${n(s?.newDay)} · board ${n(b?.newDay)}` : 'DB unreadable')}
+</tr></table>
+
+<div style="font-size:15px;font-weight:700;margin:18px 0 6px">Last ${STRIP_DAYS} days</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${bars}</table>
+
+${c ? section('Installs and CLI', [
+    row('Install scripts that day', `${scripts}${c.ps1 ? ` · ${n(c.ps1)} via .ps1` : ''} · ${n(c.fetches)} fetches`),
+    row('CLI users by version', list(c.versions)),
+    row('What the CLI did', `${cliActions || 'nothing'} <div style="font-size:11px;color:${MUTE}">unique outside IPs per kind of request · ${n(c.cliRequests)} requests</div>`),
+    row('CI runners (GitHub Actions)', c.ciKnown ? `${n(c.ciIps)} IPs · ${n(c.ciRequests)} requests, not counted above` : 'Actions ranges unavailable tonight, so CI is counted as users'),
+    row('Install clicks on browse.w3bs.org', `${n(c.clickUsers)} people · ${n(c.clicks)} clicks${c.clickPkgs.length ? `<div style="font-size:11px;color:${MUTE}">${list(c.clickPkgs)}</div>` : ''}`),
+    row('Left out', `${n(c.bots)} crawler and monitor requests · ${n(c.ours)} of our IPs`),
+  ]) : ''}
+
+${a ? section('Accounts', [
+    row('w3bs.org accounts', `${n(a.external)} outside · ${n(a.internal)} ours/QA · ${n(a.new7)} new in 7d · ${n(a.new30)} in 30d`),
+    row('Signed in that day', `${n(d.logins)} on the web · ${n(d.cliLogins)} new CLI logins (w3bs login)`),
+    row('Signed in, last 30 days', `${n(a.active30)} on the web · ${n(a.cliLoginsAll)} ever logged in from the CLI`),
+    row('App events that day', a.eventsDay.length ? list(a.eventsDay) : 'none'),
+    row('Fleet machines', `${n(a.machines.outside)} outside of ${n(a.machines.total)} · ${n(a.machines.outsideSeen)} outside seen in 24h (${n(a.machines.seen)} all) · ${n(a.machines.outsideNew)} outside joined that day`),
+    row('Fleet actions that day', `${n(a.fleetActions.outside)} by outside users · ${n(a.fleetActions.total)} all${a.fleetActions.failed ? ` · ${n(a.fleetActions.failed)} failed` : ''}${a.fleetActions.byAction.length ? ` · ${list(a.fleetActions.byAction)}` : ''}`),
+    row('A/B testing', `${n(a.ab?.experiments)} experiments · ${n(a.ab?.events)} events that day`),
+  ]) : ''}
+
+${p ? section('Publishing', [
+    row('Signed package releases', `${n(p.releasesDay)} that day (${n(p.releasesOutsideDay)} outside) · ${n(p.releasesAll)} all-time · ${n(p.outsidePublishers)} outside publishers`),
+    row('Catalog', list(p.packages.map((x) => [x.kind, x.n]))),
+    row('Resources published', `${n(p.resourcesDay)} that day · ${n(p.resourcesAll)} all-time`),
+    row('Tasks and workflows', `${n(p.tasksDay)} that day · ${n(p.tasksAll)} all-time (${n(p.tasksOutside)} outside)`),
+    row('Publisher keys', `${n(p.keysOutside)} outside · ${n(p.keysDay)} added that day`),
+  ]) : ''}
+
+${s ? section('Social and the board', [
+    row('social.w3bs.org accounts', `${n(s.outside)} outside of ${n(s.accounts)} · ${n(s.newDay)} new that day`),
+    row('Social repo writes that day', `${n(s.outsideWrites)} by ${plural(s.writers, 'outside account')} · ${n(s.writes)} all<div style="font-size:11px;color:${MUTE}">posts, likes, follows and profile edits on our PDS</div>`),
+    row('Board (w3bs.org/bbs) users', `${n(b.outside)} outside of ${n(b.users)} · ${n(b.newDay)} new · ${n(b.seenDay)} outside seen that day`),
+    row('Board posts that day', `${n(b.topicsDay)} topics · ${n(b.postsDay)} posts (${n(b.outsidePostsDay)} outside) · ${n(b.topics)} topics / ${n(b.posts)} posts all-time`),
+  ]) : ''}
+
+${t ? section('w3bs.org traffic', [
+    row('Visitors', `${n(td.visitors)} that day · ${n(t.visitors30)} in 30 days · ${n(td.signupSubmits)} sign-up/login form submits`),
+    row('Top pages', t.top.length ? t.top.map(([k, v]) => `${esc(k)} ${n(v)}`).join('<br>') : 'none'),
+    row('Referrers', t.refs.length ? t.refs.map((x) => `${esc(x.h)} ${n(x.n)}`).join(' · ') : 'none'),
+  ]) : ''}
+
+${meta.problems.length ? `<div style="font-size:12px;color:${DOWN};margin-top:12px"><b>Sources skipped:</b> ${meta.problems.map(esc).join('; ')}</div>` : ''}
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">The w3bs CLI sends no telemetry; it is counted by its user agent (w3bs/&lt;version&gt;) in dev2's nginx log. Installs = distinct client IPs that fetched install.sh or install.ps1 (w3bs, desktop/, de/, training/) from w3bs.org that day, minus our boxes (${esc(OUR_IPS.length)} IPs + private ranges) and the package scanner; "never seen" / "new" compare hashed IPs with every earlier night. CLI IPs inside GitHub's published Actions ranges are CI. Accounts matching ${esc(INTERNAL)} or named qa-*/riotcoder are counted as ours. Generated by w3bs-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
+</td></tr></table></div>`;
+}
+
+function renderText(r, meta) {
+  const c = r.nginx, a = r.accounts, t = r.traffic, s = r.community?.social, b = r.community?.bbs, d = a?.days[DAY];
+  return [
+    `W3BS nightly · ${dayLabel(DAY, true)}`,
+    '',
+    verdict(r),
+    '',
+    c ? `Installs (unique outside IPs): ${n(c.installs)}${c.complete ? '' : ' (log incomplete)'} · ${Object.entries(c.scripts).map(([k, v]) => `${k} ${v}`).join(', ')}` : '',
+    c ? `CLI users: ${n(c.cliUsers)} · versions ${c.versions.map(([k, v]) => `${k} ${v}`).join(', ') || 'none'} · CI runners ${n(c.ciIps)}` : '',
+    c ? `browse.w3bs.org install clicks: ${n(c.clickUsers)} people` : '',
+    t ? `w3bs.org visitors: ${n(t.days[DAY].visitors)} (${n(t.days[DAY].views)} views) · ${n(t.visitors30)} in 30 days` : '',
+    a ? `Accounts: ${n(a.external)} outside · ${n(d.signups)} new · ${n(d.logins)} web logins · ${n(d.cliLogins)} CLI logins` : '',
+    a ? `Fleet: ${n(a.machines.outside)} outside machines of ${n(a.machines.total)} · ${n(a.fleetActions.total)} actions` : '',
+    a ? `Publishing: ${n(a.publish.releasesDay)} releases · ${n(a.publish.resourcesDay)} resources · ${n(a.publish.tasksDay)} tasks` : '',
+    s ? `Social: ${n(s.outside)} outside accounts · ${n(s.outsideWrites)} outside writes · board ${n(b.outside)} outside users, ${n(b.postsDay)} posts` : '',
+    meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+function subjectLine(r) {
+  const c = r.nginx, a = r.accounts, t = r.traffic, d = a?.days[DAY];
+  const parts = [
+    c ? plural(c.installs, 'install') : 'installs unknown',
+    c ? plural(c.cliUsers, 'CLI user') : null,
+    t ? plural(t.days[DAY].visitors, 'visitor') : null,
+    d ? plural(d.signups, 'signup') : null,
+    a ? `${n(a.external)} real accounts` : null,
+  ].filter(Boolean);
+  return `W3BS ${dayLabel(DAY)}: ${parts.join(', ')}`;
+}
+
+// ---------------------------------------------------------------- main
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+async function main() {
+  const t0 = Date.now();
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name} (${e.message.slice(0, 160)})`); return null; } };
+  const [ngx, acc, com, trf] = await Promise.all([
+    settle('nginx', nginx), settle('accounts', accounts), settle('social', community), settle('traffic', traffic),
+  ]);
+  if (!ngx && !acc && !com && !trf) throw new Error(`no source answered:\n  ${problems.join('\n  ')}`);
+  if (ngx && !ngx.ciKnown) problems.push('GitHub Actions ranges (gh api meta failed; CI counted as CLI users)');
+
+  const hist = history();
+  const earlier = Object.entries(hist).filter(([x]) => x < DAY);
+  const seenInst = new Set(earlier.flatMap(([, h]) => h.installerHashes || []));
+  const seenCli = new Set(earlier.flatMap(([, h]) => h.cliHashes || []));
+  const newInstallers = ngx && earlier.length ? ngx.installerHashes.filter((h) => !seenInst.has(h)).length : null;
+  const newCli = ngx && earlier.length ? ngx.cliHashes.filter((h) => !seenCli.has(h)).length : null;
+
+  const snap = {
+    day: DAY,
+    installs: ngx?.installs, installsComplete: ngx?.complete, installerHashes: ngx?.installerHashes,
+    cliUsers: ngx?.cliUsers, cliHashes: ngx?.cliHashes, ciIps: ngx?.ciIps, versions: ngx?.versions,
+    visitors: trf?.days[DAY].visitors, signups: acc?.days[DAY].signups, external: acc?.external,
+  };
+  const series = {};
+  for (const x of DAYS) {
+    const h = x === DAY ? snap : hist[x];
+    if (h && h.installs !== undefined) series[x] = { installs: h.installs, cliUsers: h.cliUsers };
+  }
+  if (hist[PREV] && hist[PREV].installs !== undefined) series[PREV] = { installs: hist[PREV].installs, cliUsers: hist[PREV].cliUsers };
+  const r = { nginx: ngx, accounts: acc, community: com, traffic: trf, series, newInstallers, newCli };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', problems };
+  const html = renderHtml(r, meta), text = renderText(r, meta), subject = subjectLine(r);
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(join(DATA_DIR, 'out'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'out', 'latest.html'), html);
+  writeFileSync(join(DATA_DIR, 'out', 'latest.txt'), text);
+  // A later --day rerun after the log rotated must not wipe the night's install counts.
+  if (ngx || !hist[DAY]) writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify(snap));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(DATA_DIR, 'out', 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(key, { from: FROM, to: TO, subject, html, text });
+  console.log(`sent ${id} to ${TO.join(', ')}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`w3bs-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = resendKey();
+      if (key) await resend(key, { from: FROM, to: TO, subject: 'W3BS nightly FAILED', text: `The W3BS report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`w3bs-nightly: could not mail the failure either: ${e2.message}`); }
+    // And a text or call (bin/alert), since a failure email can fail the same way.
+    try {
+      execFileSync('alert', ['--key', 'w3bs-nightly', '--every', '12h', `w3bs-nightly failed for ${DAY}: ${String(e && e.message || e).slice(0, 200)}`], { stdio: 'ignore', timeout: 120_000 });
+    } catch { console.error('w3bs-nightly: alert failed too'); }
+  }
+  process.exit(1);
+});

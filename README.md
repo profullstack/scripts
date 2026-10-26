@@ -443,3 +443,28 @@ pairux-nightly --to a@b.com,c@d    someone else (default anthony@ + preshy@profu
 ```
 
 Runs from cron at 05:45 UTC. A failure is mailed as "PairUX nightly FAILED".
+
+## w3bs-nightly
+
+The nightly W3BS report, in the same shape as pairux-nightly and smshub-nightly.
+The w3bs CLI has no telemetry, so it is counted by its user agent
+(`w3bs/<version>`) in dev2's shared nginx log (kept ~2 days): unique outside IPs
+per day, by version and by kind of request (update check, package fetch, OS
+channel, login). IPs in GitHub's published Actions ranges are shown apart as CI.
+Installs are outside IPs fetching `install.sh` / `install.ps1` (root, `desktop/`,
+`de/`, `training/`), minus our boxes and the package scanner; browse.w3bs.org
+`/i/<publisher>/<pkg>` hits with a w3bs referer are install clicks. Accounts,
+CLI logins, fleet machines and actions, signed releases, resources and tasks
+come from the w3bs.org Postgres on dev2; Social accounts and repo writes from
+the PDS sqlite; board users and posts from `tsbb.db`; visitors, top pages and
+referrers from the CrawlProof tracker. All read-only, our accounts counted apart.
+
+```
+w3bs-nightly                     mail yesterday's (UTC) report
+w3bs-nightly --dry-run           build it under ~/.local/share/w3bs-nightly, send nothing
+w3bs-nightly --day 2026-10-25    a specific UTC day
+w3bs-nightly --to a@b.com,c@d    someone else (default anthony@ + preshy@profullstack.com)
+```
+
+Runs from cron at 05:55 UTC. A failure is mailed as "W3BS nightly FAILED" and
+raised with `alert`.
