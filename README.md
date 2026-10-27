@@ -468,3 +468,33 @@ w3bs-nightly --to a@b.com,c@d    someone else (default anthony@ + preshy@profull
 
 Runs from cron at 05:55 UTC. A failure is mailed as "W3BS nightly FAILED" and
 raised with `alert`.
+
+## threatcrush-nightly
+
+The nightly ThreatCrush report, in the same shape as w3bs-nightly and
+smshub-nightly, money first. Revenue is settled (confirmed/forwarded) rows across
+every payment table in the threatcrush.com DB (credit deposits minus code grants,
+scan orders, module and reputation subscriptions minus comp plans, licenses,
+funding, crawl sales), plus checkouts opened and paid plans running. Installs are
+outside IPs fetching `install.sh`/`install.ps1` in dev2's nginx log (kept ~2 days);
+npm downloads of `@profullstack/threatcrush` come from api.npmjs.org (posted a day
+late, shown as "·" until then). The CLI and daemon send Node's default `node`
+user agent, so CLI users are outside IPs calling `/api/` with it, and daemon
+heartbeats are ingest + ban-claim + run-poll calls (our boxes by server name).
+Accounts, logins, CLI logins, orgs/teams/fleets/invites/agent keys, servers online
+and daemon versions, GitHub App installs and repo scans, property runs, and the
+fleet's attack events (detections) and bans (remediation_actions) come from the
+threatcrush.com Supabase Postgres on dev2, read-only; visitors from CrawlProof.
+Accounts matching the internal regex are ours, and so are the orgs they created
+and those orgs' servers. `ai-scan` and local scans send nothing home, so they are
+not counted.
+
+```
+threatcrush-nightly                     mail yesterday's (UTC) report
+threatcrush-nightly --dry-run           build it under ~/.local/share/threatcrush-nightly, send nothing
+threatcrush-nightly --day 2026-10-26    a specific UTC day
+threatcrush-nightly --to a@b.com,c@d    someone else (default anthony@ + preshy@profullstack.com)
+```
+
+Runs from cron at 06:00 UTC. A failure is mailed as "ThreatCrush nightly FAILED"
+and raised with `alert --key threatcrush-nightly`.
