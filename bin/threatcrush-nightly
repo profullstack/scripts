@@ -1,0 +1,675 @@
+#!/usr/bin/env node
+// threatcrush-nightly — one email a night about threatcrush.com: money first, then who
+// installed it, who ran the CLI and daemon, who signed up, what got scanned, and what
+// the fleet's daemons caught and banned. Our own boxes, CI, crawlers and test accounts
+// are taken out everywhere (our boxes' daemons are shown apart as "our fleet").
+//
+//   threatcrush-nightly                    send the report for yesterday (UTC)
+//   threatcrush-nightly --dry-run          build it, write it under the data dir, send nothing
+//   threatcrush-nightly --day 2026-10-26   report a specific UTC day (installs, CLI and
+//                                          heartbeats need the nginx logs, which dev2 keeps ~2 days)
+//   threatcrush-nightly --to a@b.com,c@d   someone else (default anthony@ + preshy@profullstack.com)
+//
+// Sources, each of which may fail on its own and is then named in the email:
+//   nginx    dev2's shared access log, threatcrush.com + www: installs = 2xx GET/HEAD of
+//            /install.sh|ps1 from outside IPs (the w3bs package scanner and crawlers left
+//            out). The CLI and daemon send no user agent of their own (Node's fetch says
+//            "node"), so a CLI user = an outside IP calling /api/ with UA node or
+//            threatcrush/<ver>; daemon heartbeats = /api/ingest + remediations/claim +
+//            runs/pending calls. POST /api/scan* from outside = web scans.
+//   npm      api.npmjs.org daily downloads of @profullstack/threatcrush, and the last-week
+//            per-version split (npm posts a day late; an unposted day shows "·").
+//   db       the threatcrush.com Supabase Postgres on dev2, read-only: auth.users +
+//            audit log (signups, logins), cli_login_requests, organizations/teams/fleets/
+//            invites/agent_keys, servers (online, versions), github_installations +
+//            github_repo_scans, property_runs, detections + remediation_actions (attacks and
+//            bans fleet-wide) and every payment table (credit_deposits, scan_orders,
+//            module_subscriptions, reputation_subscriptions, license_purchases,
+//            funding_payments, crawl_sales).
+//   traffic  CrawlProof tracker rollups of the threatcrush.com project, found by url.
+// Secrets: RESEND_API_KEY and CRAWLPROOF_DB_URL from the team vault fleet-nightly--prod.
+// The DB URL is the dev2 fleet kit state (~/.local/state/dev2-fleet/threatcrush.com.json).
+
+import { execFile, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  join(homedir(), '.bun/bin'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+  process.env.PATH || '',
+].join(':');
+
+const DATA_DIR = process.env.THREATCRUSH_NIGHTLY_DATA || join(homedir(), '.local/share/threatcrush-nightly');
+const STATE = join(process.env.DEV2_FLEET_STATE || join(homedir(), '.local/state/dev2-fleet'), 'threatcrush.com.json');
+const SITE = 'threatcrush.com';
+const NPM_PKG = '@profullstack/threatcrush';
+const DEFAULT_FROM = 'ThreatCrush nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'anthony@profullstack.com,preshy@profullstack.com';
+// Our own egress: dev1 (v4 + v6), dev2, vienna, seed1, bbs, dev3, bonita, plus
+// docker/wireguard/private ranges. The public IPs of servers in our own orgs are added
+// from the DB at run time, so a new box of ours never counts as a customer.
+const OUR_IPS = (process.env.THREATCRUSH_OUR_IPS ||
+  '67.205.189.229,2604:a880:400:d1:0:4:c3fe:1,23.95.228.174,152.53.47.37,104.152.209.195,23.95.86.145,172.12.140.170,2.56.246.141,2.56.246.142').split(',');
+const PRIVATE = /^(10\.|127\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|::1$|fd)/;
+// Accounts that are us or our tests (riotcoder@ is @profullstack.com). Postgres regex syntax.
+const INTERNAL = '@(profullstack\\.com|threatcrush\\.com|chovy\\.com|example\\.com|mailinator\\.com)$|^ettinger@gmail\\.com$|^riotcoder|^qa[.+-]|\\+qa@';
+const SETTLED = ['confirmed', 'forwarded'];
+const STRIP_DAYS = 7;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = (opt('--to') || process.env.THREATCRUSH_REPORT_TO || DEFAULT_TO).split(',').map((s) => s.trim()).filter(Boolean);
+const FROM = process.env.THREATCRUSH_REPORT_FROM || DEFAULT_FROM;
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(DAY, i - STRIP_DAYS + 1));
+const FROM7 = addDays(DAY, -6), FROM30 = addDays(DAY, -29);
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  const p = execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000, env: { ...process.env, ...opts.env } }, (err, out, errOut) => {
+    if (!err) return resolve(out);
+    const lines = (errOut || err.message).trim().split('\n');
+    const errs = lines.filter((l) => /error/i.test(l));
+    reject(new Error(`${cmd}: ${(errs.length ? errs : lines.slice(-3)).slice(0, 3).join(' ')}`));
+  });
+  if (opts.input) { p.stdin.end(opts.input); }
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+let vaultCache;
+function vault() {
+  if (vaultCache) return vaultCache;
+  vaultCache = {};
+  const dir = mkdtempSync(join(tmpdir(), 'threatcrush-nightly-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    vaultCache = parseEnv(readFileSync(join(dir, 'env'), 'utf8'));
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  return vaultCache;
+}
+const secret = (k) => process.env[k] || vault()[k];
+
+function resendKey() {
+  const k = secret('RESEND_API_KEY');
+  if (k) return k;
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+/** Named read-only queries against one Postgres, through Bun's client. */
+async function pg(url, queries) {
+  const script = `
+    import { SQL } from "bun";
+    const sql = new SQL(process.env.DBURL);
+    await sql.unsafe("set session characteristics as transaction read only");
+    const [ro] = await sql.unsafe("show transaction_read_only");
+    if (ro.transaction_read_only !== "on") throw new Error("not read-only");
+    const qs = JSON.parse(process.env.QUERIES), out = {};
+    for (const [k, q] of Object.entries(qs)) out[k] = await sql.unsafe(q.sql, q.params || []);
+    console.log(JSON.stringify(out));
+    await sql.close();`;
+  const out = await run('bun', ['-e', script], { env: { DBURL: url.replace(/sslmode=no-verify/, 'sslmode=require'), QUERIES: JSON.stringify(queries) }, timeout: 180_000 });
+  return JSON.parse(out.trim().split('\n').pop());
+}
+
+const sum = (xs, f = (x) => x) => xs.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+const hashIp = (ip) => createHash('sha256').update(`threatcrush-nightly:${ip}`).digest('hex').slice(0, 16);
+const countBy = (xs, f) => Object.entries(xs.reduce((a, x) => ((a[f(x)] = (a[f(x)] || 0) + 1), a), {})).sort((a, b) => b[1] - a[1]);
+
+// ---------------------------------------------------------------- sources
+
+/** Raw per-IP rows for one UTC day from dev2's shared nginx log; summarised in main once our IPs are known. */
+async function nginxRows() {
+  const [y, , d] = DAY.split('-');
+  const mon = new Date(`${DAY}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', timeZone: 'UTC' });
+  const stamp = `${d}/${mon}/${y}`;
+  // One record per request we care about: "<kind> <ip> <detail>". Fields split on '"':
+  // $1 = host ip - - [time], $2 = request line, $3 = status bytes, $6 = user agent.
+  const remote = `cd /var/log/nginx && { cat access.log access.log.1 2>/dev/null; zcat access.log.*.gz 2>/dev/null; } | ` +
+    `awk -F'"' -v s='[${stamp}:' 'index($1, s) { split($1, h, " "); if (h[1] !~ /^(www\\.)?threatcrush\\.com$/) next; ` +
+    `split($2, r, " "); p = r[2]; sub(/\\?.*/, "", p); split($3, st, " "); ua = $6; lua = tolower(ua); ` +
+    `if ((ua == "node" || ua ~ /^(threatcrush|undici)/) && p ~ /^\\/api\\//) { v = "-"; if (ua ~ /^threatcrush\\//) { split(ua, vv, "[/ ]"); v = vv[2] } a = "other"; ` +
+    `  if (p ~ /^\\/api\\/ingest/) a = "ingest"; else if (p ~ /\\/remediations\\/claim$/) a = "claim"; else if (p ~ /\\/runs\\/pending$/) a = "runs"; ` +
+    `  else if (p ~ /^\\/api\\/auth\\//) a = "login"; else if (p ~ /^\\/api\\/v1\\/reputation/) a = "reputation"; else if (p ~ /^\\/api\\/orgs/) a = "orgs"; ` +
+    `  print "cli", h[2], v "|" a; next } ` +
+    `if (lua ~ /bot|crawl|spider|slurp|preview|gatus|uptime|monitor|headless|python-requests|go-http|scanner|crawlproof|semrush|ahrefs|externalhit|outreachgraph/) { print "bot", h[2], "-"; next } ` +
+    `if ((r[1] == "GET" || r[1] == "HEAD") && st[1] ~ /^2/ && p ~ /^\\/install\\.(sh|ps1)$/) { k = lua ~ /^(curl|wget|powershell|mozilla\\/5\\.0 \\(windows nt; windows nt)/ ? "shell" : "browser"; print "inst", h[2], substr(p, 2) "|" k; next } ` +
+    `if (r[1] == "POST" && p ~ /^\\/api\\/scan/) { print "scan", h[2], p } }' | sort | uniq -c; ` +
+    `echo "OLDEST $(ls -tr access.log.*.gz 2>/dev/null | head -1 | xargs -r zcat 2>/dev/null | head -1 | grep -oE '\\[[^]]+\\]')"`;
+  const local = hostname().startsWith('dev2');
+  const out = local ? await run('bash', ['-s'], { input: remote, timeout: 300_000 })
+    : await run('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', 'dev2', 'bash', '-s'], { input: remote, timeout: 300_000 });
+  let oldest = null; const rows = [];
+  for (const line of out.split('\n')) {
+    if (line.startsWith('OLDEST ')) { oldest = line.slice(7); continue; }
+    const m = /^\s*(\d+)\s+(\S+)\s+(\S+)\s+(\S+)$/.exec(line);
+    if (m) rows.push({ kind: m[2], ip: m[3], detail: m[4], hits: +m[1] });
+  }
+  const t = /\[(\d+)\/(\w+)\/(\d+):(\d+:\d+:\d+)/.exec(oldest || '');
+  const complete = !t || Date.parse(`${t[1]} ${t[2]} ${t[3]} ${t[4]} UTC`) <= Date.parse(`${DAY}T00:00:00Z`);
+  return { rows, complete, oldest };
+}
+
+/** Installs, CLI users and daemon heartbeats; IPs leave only as hashes, our boxes by server name. */
+function summariseNginx(raw, ours, serverByIp) {
+  const isOurs = (ip) => ours.has(ip) || PRIVATE.test(ip);
+  const uniq = (xs) => [...new Set(xs.map((x) => x.ip))];
+  const rows = raw.rows, outside = rows.filter((x) => !isOurs(x.ip));
+
+  const inst = outside.filter((x) => x.kind === 'inst');
+  const installers = uniq(inst);
+  const shell = uniq(inst.filter((x) => x.detail.endsWith('|shell'))).length;
+  const ps1 = uniq(inst.filter((x) => x.detail.startsWith('install.ps1'))).length;
+
+  const cli = outside.filter((x) => x.kind === 'cli');
+  const cliUsers = uniq(cli);
+  const versions = {};
+  for (const ip of cliUsers) {
+    const v = cli.filter((x) => x.ip === ip).map((x) => x.detail.split('|')[0]).sort((a, b) => a.localeCompare(b, 'en', { numeric: true })).pop();
+    if (v !== '-') versions[v] = (versions[v] || 0) + 1;
+  }
+  const actions = {};
+  for (const x of cli) { const a = x.detail.split('|')[1]; (actions[a] ||= new Set()).add(x.ip); }
+  const beat = (x) => /\|(ingest|claim|runs)$/.test(x.detail);
+  const outsideDaemons = uniq(cli.filter(beat));
+
+  // Our own daemons calling home, by server name.
+  const oursBeats = {};
+  for (const x of rows.filter((x) => x.kind === 'cli' && isOurs(x.ip) && beat(x))) {
+    const name = serverByIp[x.ip] || (PRIVATE.test(x.ip) ? 'dev2 (docker)' : x.ip);
+    oursBeats[name] = (oursBeats[name] || 0) + x.hits;
+  }
+  const scans = outside.filter((x) => x.kind === 'scan');
+  return {
+    installs: installers.length, shell, ps1, fetches: sum(inst, (x) => x.hits),
+    installerHashes: installers.map(hashIp),
+    cliUsers: cliUsers.length, cliRequests: sum(cli, (x) => x.hits), cliHashes: cliUsers.map(hashIp),
+    versions: Object.entries(versions).sort((a, b) => b[0].localeCompare(a[0], 'en', { numeric: true })),
+    actions: Object.fromEntries(Object.entries(actions).map(([k, v]) => [k, v.size])),
+    outsideDaemons: outsideDaemons.length, outsideBeats: sum(cli.filter(beat), (x) => x.hits),
+    oursBeats: Object.entries(oursBeats).sort((a, b) => b[1] - a[1]),
+    webScans: sum(scans, (x) => x.hits), webScanners: uniq(scans).length,
+    bots: sum(rows.filter((x) => x.kind === 'bot'), (x) => x.hits),
+    ours: new Set(rows.filter((x) => isOurs(x.ip)).map((x) => x.ip)).size,
+    complete: raw.complete, oldest: raw.oldest,
+  };
+}
+
+/** Daily npm downloads (to the reported day) and last week's per-version split. */
+async function npm() {
+  const e = encodeURIComponent(NPM_PKG);
+  const get = async (u) => { const r = await fetch(u, { signal: AbortSignal.timeout(30_000) }); if (!r.ok) throw new Error(`npm ${r.status}`); return r.json(); };
+  // npm posts a day late and answers 0 for a day it has not posted; a big package tells us which.
+  const [range, ver, probe] = await Promise.all([
+    get(`https://api.npmjs.org/downloads/range/${FROM30}:${DAY}/${e}`),
+    get(`https://api.npmjs.org/versions/${e}/last-week`).catch(() => null),
+    get(`https://api.npmjs.org/downloads/point/${DAY}/express`).catch(() => null),
+  ]);
+  const posted = !probe || probe.downloads > 0;
+  const days = Object.fromEntries((range.downloads || []).map((x) => [x.day, x.downloads]));
+  if (!posted) days[DAY] = null;
+  const versions = Object.entries(ver?.downloads || {}).filter(([, v]) => v > 0)
+    .sort((a, b) => b[0].localeCompare(a[0], 'en', { numeric: true }));
+  return {
+    days, posted,
+    week: sum(DAYS.map((d) => days[d])), month: sum(Object.values(days)),
+    versions, versionsWeek: sum(versions, (x) => x[1]),
+  };
+}
+
+/** Everything in the threatcrush.com DB. Emails never leave the queries. */
+async function db() {
+  const url = JSON.parse(readFileSync(STATE, 'utf8')).sb_database_url;
+  const D = `$1::date`, IN_DAY = (c) => `${c} >= ${D} and ${c} < ${D} + 1`;
+  // Users who are us; orgs created by us. Both reused by the queries below.
+  // INTERNAL is a constant with no quotes in it, so it is inlined rather than bound.
+  const OURS_U = `(select id from auth.users where coalesce(email, '') ~* '${INTERNAL}')`;
+  const OURS_O = `(select id from organizations where created_by in ${OURS_U})`;
+  const pay = (table, dayCol, amount = 'amount_usd', extra = 'true', who = 'user_id', status = 'status') => ({
+    sql: `select '${table}' t, ${status} status, (${amount})::float a, ${dayCol}::date::text d, created_at::date::text c,
+      coalesce(${who} in ${OURS_U}, false) ours from ${table} where ${extra}` });
+  const q = await pg(url, {
+    users: { sql: `select created_at::date::text d, (email_confirmed_at is not null) confirmed, (id in ${OURS_U}) ours from auth.users` },
+    logins: { sql: `select created_at::date::text d, payload->>'actor_id' u from auth.audit_log_entries
+        where payload->>'action' = 'login' and created_at >= $1::date - 30 and created_at < $1::date + 1
+        and (payload->>'actor_id')::uuid not in ${OURS_U}`, params: [DAY] },
+    cliLogins: { sql: `select consumed_at::date::text d, user_id u from cli_login_requests where consumed_at is not null and user_id not in ${OURS_U}` },
+    orgs: { sql: `select 'org' k, created_at::date::text d, (id in ${OURS_O}) ours from organizations
+        union all select 'team', created_at::date::text, (org_id in ${OURS_O}) from teams
+        union all select 'fleet', created_at::date::text, (org_id in ${OURS_O}) from fleets
+        union all select 'member', added_at::date::text, (user_id in ${OURS_U}) from team_members
+        union all select 'invite', created_at::date::text, (org_id in ${OURS_O}) from team_invites
+        union all select 'invite_accepted', accepted_at::date::text, (org_id in ${OURS_O}) from team_invites where accepted_at is not null
+        union all select 'agent_key', created_at::date::text, (org_id in ${OURS_O}) from agent_keys where revoked_at is null` },
+    servers: { sql: `select s.name, coalesce(s.public_ip, s.ip_address) ip, s.status, s.last_seen, s.threatcrushd_version v,
+        s.created_at::date::text d, (s.org_id in ${OURS_O}) ours from servers s` },
+    gh: { sql: `select coalesce(installed_at, created_at)::date::text d, deleted_at::date::text del, status, account_type from github_installations` },
+    ghScans: { sql: `select created_at::date::text d, status, findings_count f from github_repo_scans where created_at >= $1::date - 1 and created_at < $1::date + 1`, params: [DAY] },
+    ghScansAll: { sql: `select count(*)::int n from github_repo_scans` },
+    runs: { sql: `select created_at::date::text d, type, status, (org_id in ${OURS_O}) ours from property_runs where created_at >= $1::date - 1 and created_at < $1::date + 1`, params: [DAY] },
+    runsAll: { sql: `select count(*)::int n, count(*) filter (where org_id not in ${OURS_O})::int outside from property_runs` },
+    det: { sql: `select detected_at::date::text d, severity, count(*)::int n, sum(coalesce(occurrences, 1))::int occ,
+        count(distinct source_ip)::int ips from detections where detected_at >= $1::date - 1 and detected_at < $1::date + 1 group by 1, 2`, params: [DAY] },
+    detIps: { sql: `select detected_at::date::text d, count(distinct source_ip)::int ips from detections
+        where detected_at >= $1::date - 1 and detected_at < $1::date + 1 group by 1`, params: [DAY] },
+    detRules: { sql: `select rule_id r, count(*)::int n from detections where ${IN_DAY('detected_at')} group by 1 order by 2 desc limit 8`, params: [DAY] },
+    detServers: { sql: `select coalesce(s.name, 'unknown') s, (d.organization_id in ${OURS_O}) ours, count(*)::int n from detections d
+        left join servers s on s.id = d.server_id where ${IN_DAY('d.detected_at')} group by 1, 2 order by 3 desc`, params: [DAY] },
+    rem: { sql: `select created_at::date::text d, action_type a, status, count(*)::int n, count(distinct target_value)::int t
+        from remediation_actions where created_at >= $1::date - 1 and created_at < $1::date + 1 group by 1, 2, 3`, params: [DAY] },
+    banned: { sql: `select count(distinct target_value)::int n from remediation_actions where action_type = 'block'
+        and status = 'executed' and executed_at < $1::date + 1 and (expires_at is null or expires_at >= $1::date + 1)`, params: [DAY] },
+    pay: { sql: [
+      pay('credit_deposits', 'confirmed_at', 'amount_usd', 'grant_source is null'),
+      pay('scan_orders', 'paid_at'),
+      pay('module_subscriptions', 'period_start', 'amount_usd', "source <> 'comp'"),
+      pay('reputation_subscriptions', 'period_start', 'amount_usd', "plan not like 'comp%'"),
+      pay('license_purchases', 'updated_at'),
+      pay('funding_payments', 'paid_at', 'amount_usd', 'true', 'null::uuid'),
+      // crawl_sales has no status: every row is a settled paywall sale.
+      pay('crawl_sales', 'created_at', 'total_cents / 100.0', 'true', 'null::uuid', `'confirmed'`),
+    ].map((x) => x.sql).join('\nunion all\n') },
+    paidPlans: { sql: `select 'module ' || module k, (user_id in ${OURS_U}) ours from module_subscriptions where status = any($1) and source <> 'comp' and period_end > now()
+        union all select 'reputation ' || plan, (user_id in ${OURS_U}) from reputation_subscriptions where status = any($1) and plan not like 'comp%' and period_end > now()
+        union all select 'license', (id in ${OURS_U}) from user_profiles where license_status = 'active'`, params: [SETTLED] },
+  });
+
+  const users = q.users, out = users.filter((u) => !u.ours);
+  const perDay = (d) => ({
+    signups: out.filter((u) => u.d === d).length,
+    confirmed: out.filter((u) => u.d === d && u.confirmed).length,
+    logins: new Set(q.logins.filter((x) => x.d === d).map((x) => x.u)).size,
+    cliLogins: new Set(q.cliLogins.filter((x) => x.d === d).map((x) => x.u)).size,
+  });
+  const org = (k, f = () => true) => q.orgs.filter((x) => x.k === k && f(x));
+  const orgStats = Object.fromEntries(['org', 'team', 'fleet', 'member', 'invite', 'invite_accepted', 'agent_key'].map((k) => [k, {
+    all: org(k).length, outside: org(k, (x) => !x.ours).length, day: org(k, (x) => x.d === DAY).length, outsideDay: org(k, (x) => !x.ours && x.d === DAY).length,
+  }]));
+
+  const now = Date.now();
+  const online = (s) => s.last_seen && now - Date.parse(s.last_seen) < 15 * 60_000;
+  const sv = q.servers, svOut = sv.filter((s) => !s.ours);
+
+  const detDay = (d) => {
+    const rows = q.det.filter((r) => r.d === d);
+    return {
+      events: sum(rows, (r) => r.n), occurrences: sum(rows, (r) => r.occ),
+      ips: q.detIps.find((r) => r.d === d)?.ips ?? 0,
+      severity: Object.fromEntries(rows.map((r) => [r.severity, r.n])),
+    };
+  };
+  const remDay = (d) => ({
+    blocks: sum(q.rem.filter((r) => r.d === d && r.a === 'block' && r.status === 'executed'), (r) => r.n),
+    blockedIps: sum(q.rem.filter((r) => r.d === d && r.a === 'block' && r.status === 'executed'), (r) => r.t),
+    unblocks: sum(q.rem.filter((r) => r.d === d && r.a === 'unblock'), (r) => r.n),
+    failed: sum(q.rem.filter((r) => r.d === d && /fail|error/.test(r.status || '')), (r) => r.n),
+    other: countBy(q.rem.filter((r) => r.d === d && !['block', 'unblock'].includes(r.a)), (r) => r.a),
+  });
+
+  const pays = q.pay.filter((r) => !r.ours);
+  const settled = pays.filter((r) => SETTLED.includes(r.status) && r.a > 0);
+  const money = (d) => ({
+    settled: sum(settled.filter((r) => r.d === d), (r) => r.a),
+    payments: settled.filter((r) => r.d === d).length,
+    opened: pays.filter((r) => r.c === d && r.t !== 'crawl_sales').length,
+  });
+  return {
+    accounts: {
+      total: users.length, external: out.length, internal: users.length - out.length,
+      new7: out.filter((u) => u.d >= FROM7 && u.d <= DAY).length,
+      new30: out.filter((u) => u.d >= FROM30 && u.d <= DAY).length,
+      confirmedAll: out.filter((u) => u.confirmed).length,
+      lastSignup: out.map((u) => u.d).filter((d) => d <= DAY).sort().pop() || null,
+      active30: new Set(q.logins.map((x) => x.u)).size,
+      cliLoginsAll: new Set(q.cliLogins.map((x) => x.u)).size,
+      days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, perDay(d)])),
+    },
+    orgs: orgStats,
+    servers: {
+      total: sv.length, outside: svOut.length, online: sv.filter(online).length, outsideOnline: svOut.filter(online).length,
+      outsideNew: svOut.filter((s) => s.d === DAY).length,
+      versions: countBy(sv.filter(online), (s) => s.v || '?'),
+      outsideVersions: countBy(svOut, (s) => s.v || '?'),
+      offline: sv.filter((s) => s.ours && !online(s)).map((s) => s.name),
+    },
+    ourIps: sv.filter((s) => s.ours && s.ip).map((s) => s.ip),
+    serverByIp: Object.fromEntries(sv.filter((s) => s.ip).map((s) => [s.ip, s.name])),
+    github: {
+      active: q.gh.filter((g) => !g.del && g.status !== 'deleted').length, all: q.gh.length,
+      newDay: q.gh.filter((g) => g.d === DAY).length, newPrev: q.gh.filter((g) => g.d === PREV).length,
+      removedDay: q.gh.filter((g) => g.del === DAY).length,
+      scansDay: q.ghScans.filter((s) => s.d === DAY).length, scansPrev: q.ghScans.filter((s) => s.d === PREV).length,
+      scanFindingsDay: sum(q.ghScans.filter((s) => s.d === DAY), (s) => s.f),
+      scansFailedDay: q.ghScans.filter((s) => s.d === DAY && /fail|error/.test(s.status || '')).length,
+      scansAll: q.ghScansAll[0].n,
+    },
+    runs: {
+      day: q.runs.filter((r) => r.d === DAY && !r.ours).length, prev: q.runs.filter((r) => r.d === PREV && !r.ours).length,
+      oursDay: q.runs.filter((r) => r.d === DAY && r.ours).length,
+      byType: countBy(q.runs.filter((r) => r.d === DAY), (r) => r.type || '?'),
+      all: q.runsAll[0].n, outsideAll: q.runsAll[0].outside,
+    },
+    attacks: {
+      day: detDay(DAY), prev: detDay(PREV), rules: q.detRules.map((r) => [r.r, r.n]),
+      servers: q.detServers.map((r) => [r.ours ? r.s : `${r.s} (customer)`, r.n]),
+      outsideEvents: sum(q.detServers.filter((r) => !r.ours), (r) => r.n),
+      rem: remDay(DAY), remPrev: remDay(PREV), bannedNow: q.banned[0].n,
+    },
+    money: {
+      day: money(DAY), prev: money(PREV),
+      allTime: sum(settled, (r) => r.a), customers: settled.length,
+      byTable: countBy(settled, (r) => r.t),
+      pendingDay: pays.filter((r) => r.c === DAY && !SETTLED.includes(r.status) && r.t !== 'crawl_sales').map((r) => [r.t, r.a]),
+      firstEver: settled.length > 0 && settled.every((r) => r.d === DAY),
+      plans: countBy(q.paidPlans.filter((x) => !x.ours), (x) => x.k),
+      oursPlans: q.paidPlans.filter((x) => x.ours).length,
+    },
+  };
+}
+
+/** Human traffic on threatcrush.com from the CrawlProof tracker rollups. */
+async function traffic() {
+  const url = secret('CRAWLPROOF_DB_URL');
+  if (!url) throw new Error('no CRAWLPROOF_DB_URL');
+  const host = SITE.replace(/\./g, '\\.');
+  const proj = await pg(url, { p: { sql: `select id::text id from projects where url ~* $1 and archived_at is null order by tracker_enabled desc nulls last, created_at limit 1`, params: [`^https?://(www\\.)?${host}(/|$)`] } });
+  const id = proj.p[0]?.id;
+  if (!id) throw new Error(`no tracker project for ${SITE}`);
+  const from = addDays(FROM30, -1);
+  const q = await pg(url, {
+    ev: { sql: `select day::text d, event, page_path p, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1, 2, 3`, params: [id, from, DAY] },
+    vis: { sql: `select day::text d, count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1`, params: [id, from, DAY] },
+    v30: { sql: `select count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3`, params: [id, FROM30, DAY] },
+    refs: { sql: `select coalesce(nullif(referrer_host, ''), 'direct') h, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and event = 'pageview' and day = $2
+        and coalesce(referrer_host, '') !~* '(^|\\.)threatcrush\\.com$' group by 1 order by 2 desc limit 6`, params: [id, DAY] },
+  });
+  const pv = (d) => sum(q.ev.filter((r) => r.d === d && r.event === 'pageview'), (r) => r.n);
+  const per = (d) => ({
+    visitors: q.vis.find((r) => r.d === d)?.v ?? 0,
+    views: pv(d),
+    pricing: sum(q.ev.filter((r) => r.d === d && r.event === 'pageview' && /^\/pricing/.test(r.p || '')), (r) => r.n),
+    signupSubmits: sum(q.ev.filter((r) => r.d === d && r.event === 'form_submit' && /^\/auth\/(signup|login)/.test(r.p || '')), (r) => r.n),
+  });
+  const top = Object.entries(q.ev.filter((r) => r.d === DAY && r.event === 'pageview').reduce((a, r) => ((a[r.p] = (a[r.p] || 0) + r.n), a), {}))
+    .sort((a, b) => b[1] - a[1]).slice(0, 8);
+  return { project: id, days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])), visitors30: q.v30[0]?.v ?? 0, top, refs: q.refs };
+}
+
+// ---------------------------------------------------------------- history
+
+function history() {
+  const dir = join(DATA_DIR, 'days');
+  const out = {};
+  if (existsSync(dir)) for (const f of readdirSync(dir)) if (f.endsWith('.json')) {
+    try { out[f.slice(0, 10)] = JSON.parse(readFileSync(join(dir, f), 'utf8')); } catch {}
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- render
+
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', RED = '#c2410c', GOLD = '#b7791f';
+const n = (v) => (v === null || v === undefined ? '·' : Number(v).toLocaleString('en-US'));
+const usd = (v) => (v === null || v === undefined ? '·' : `$${Number(v).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const signed = (d) => (d > 0 ? `+${n(d)}` : d < 0 ? `-${n(-d)}` : '±0');
+const plural = (k, word) => `${n(k)} ${word}${k === 1 ? '' : 's'}`;
+const list = (xs) => (xs.length ? xs.map(([k, v]) => `${esc(k)} ${n(v)}`).join(' · ') : 'none');
+const vs = (cur, prev) => (cur === null || cur === undefined || prev === null || prev === undefined ? '' : ` (${signed(cur - prev)} vs ${dayLabel(PREV)})`);
+
+function verdict(r) {
+  const parts = [];
+  const g = r.nginx, b = r.db, t = r.traffic, m = b?.money;
+  if (m) parts.push(m.day.payments ? `${usd(m.day.settled)} came in from ${plural(m.day.payments, 'payment')}.` : `No money came in (${usd(m.allTime)} from outside customers all-time).`);
+  if (g) parts.push(`${plural(g.installs, 'outside install')} and ${plural(g.cliUsers, 'outside CLI user')}.`);
+  if (t) parts.push(`${n(t.days[DAY].visitors)} people on threatcrush.com (${n(t.visitors30)} in 30 days).`);
+  if (b) parts.push(`${n(b.accounts.days[DAY].signups)} signups; ${plural(b.accounts.external, 'outside account')}, ${plural(b.servers.outside, 'outside server')}.`);
+  if (b) parts.push(`Our fleet logged ${n(b.attacks.day.events)} attacks from ${n(b.attacks.day.ips)} IPs and banned ${n(b.attacks.rem.blockedIps)}.`);
+  return parts.join(' ') || 'No source answered tonight.';
+}
+
+function renderHtml(r, meta) {
+  const tile = (label, cur, prev, sub, fmt = n) => `<td style="width:25%;background:#f4f4f2;border-radius:8px;padding:10px 12px;vertical-align:top">
+<div style="font-size:12px;color:${MUTE}">${label}</div>
+<div style="font-size:24px;font-weight:700;margin-top:2px">${fmt(cur)}</div>
+<div style="font-size:12px;color:${prev === null || prev === undefined || cur === null ? MUTE : cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev === null || prev === undefined || cur === null ? '&nbsp;' : `${cur - prev > 0 ? '+' : cur - prev < 0 ? '-' : '±'}${fmt(Math.abs(cur - prev)).replace(/^\$?0$/, '0')} vs ${esc(dayLabel(PREV))}`}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:4px">${sub}</div></td>`;
+  const row = (k, v) => `<tr><td style="padding:6px 8px 6px 0;border-bottom:1px solid ${LINE};color:${MUTE};vertical-align:top;width:38%">${k}</td><td style="padding:6px 0;border-bottom:1px solid ${LINE};text-align:right">${v}</td></tr>`;
+  const section = (title, rows) => `<div style="font-size:15px;font-weight:700;margin:20px 0 4px">${title}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;border-collapse:collapse">${rows.filter(Boolean).join('\n')}</table>`;
+  const small = (s) => `<div style="font-size:11px;color:${MUTE}">${s}</div>`;
+
+  const g = r.nginx, b = r.db, t = r.traffic, p = r.npm;
+  const a = b?.accounts, d = a?.days[DAY], td = t?.days[DAY], m = b?.money, at = b?.attacks, sv = b?.servers, o = b?.orgs;
+  const max = Math.max(1, ...DAYS.map((x) => t?.days[x]?.visitors || 0));
+  const bars = DAYS.map((x) => {
+    const v = t?.days[x]?.visitors ?? 0, h = r.series[x] || {}, ad = a?.days[x];
+    const w = Math.max(v ? 2 : 0, Math.round((v / max) * 100));
+    return `<tr><td style="font-size:12px;color:${x === DAY ? INK : MUTE};padding:2px 8px 2px 0;white-space:nowrap;width:90px">${esc(dayLabel(x))}</td>
+<td style="padding:2px 0"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>${w ? `<td style="width:${w}%;background:${x === DAY ? RED : '#f2b48f'};height:10px;border-radius:3px;font-size:0;line-height:0">&nbsp;</td>` : ''}<td style="font-size:0">&nbsp;</td></tr></table></td>
+<td style="font-size:12px;text-align:right;padding-left:8px;white-space:nowrap;width:290px">${t ? `${n(v)} visitors` : ''}${h.installs !== undefined ? ` · ${n(h.installs)} inst · ${n(h.cliUsers)} cli` : ' · <span style="color:#c9c8c2">no log</span>'}${p ? ` · ${n(p.days[x])} npm` : ''}${ad ? ` · ${n(ad.signups)} signups` : ''}</td></tr>`;
+  }).join('');
+  const sev = (s) => ['critical', 'high', 'medium', 'low', 'info'].filter((k) => s[k]).map((k) => `${k} ${n(s[k])}`).join(' · ') || 'none';
+  const cliKinds = g ? Object.entries(g.actions).sort((x, y) => y[1] - x[1]).map(([k, v]) => `${esc({ ingest: 'event ingest', claim: 'ban claim', runs: 'scan-run poll', login: 'login/refresh', reputation: 'reputation', orgs: 'org/servers', other: 'other' }[k] || k)} ${n(v)}`).join(' · ') : '';
+
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">
+<div style="font-size:20px;font-weight:700">ThreatCrush nightly · ${esc(dayLabel(DAY, true))}</div>
+<div style="font-size:13px;color:${MUTE};margin-top:2px">UTC day · our boxes, CI, crawlers and test accounts excluded · compared with ${esc(dayLabel(PREV))}</div>
+${m?.firstEver ? `<div style="font-size:15px;font-weight:700;margin-top:12px;padding:10px 12px;background:#fdf3d7;border-left:3px solid ${GOLD}">First outside payment ever: ${usd(m.day.settled)}</div>` : ''}
+<div style="font-size:14px;margin-top:12px;padding:10px 12px;border-left:3px solid ${RED};background:#fbefe8">${esc(verdict(r))}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:14px -6px 0;border-collapse:separate"><tr>
+${tile('Revenue', m ? m.day.settled : null, m ? m.prev.settled : null, m ? `${plural(m.day.payments, 'payment')} · ${n(m.day.opened)} checkouts opened` : 'DB unreadable', usd)}
+${tile('Installs', g ? g.installs : null, r.series[PREV]?.installs ?? null, g ? `outside IPs on install.sh${g.complete ? '' : ' · log incomplete'}${r.newInstallers !== null ? ` · ${n(r.newInstallers)} never seen` : ''}${p ? ` · npm ${n(p.days[DAY])}` : ''}` : 'nginx log unreadable')}
+${tile('Visitors', td ? td.visitors : null, t ? t.days[PREV].visitors : null, t ? `humans on threatcrush.com · ${n(td.views)} views` : 'tracker unreadable')}
+${tile('Signups', d ? d.signups : null, a ? a.days[PREV].signups : null, a ? `${n(d.confirmed)} confirmed · ${n(a.external)} outside accounts` : 'DB unreadable')}
+</tr></table>
+
+<div style="font-size:15px;font-weight:700;margin:18px 0 6px">Last ${STRIP_DAYS} days</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">${bars}</table>
+
+${m ? section('Money', [
+    row('Settled that day', `${usd(m.day.settled)} from ${plural(m.day.payments, 'payment')} (${usd(m.prev.settled)} on ${esc(dayLabel(PREV))})`),
+    row('Checkouts opened that day', `${n(m.day.opened)}${m.pendingDay.length ? small(`still unpaid: ${m.pendingDay.map(([k, v]) => `${esc(k)} ${usd(v)}`).join(' · ')}`) : ''}`),
+    row('Paid plans running (outside)', m.plans.length ? list(m.plans) : `none${m.oursPlans ? ` (${n(m.oursPlans)} of ours/comp left out)` : ''}`),
+    row('All-time from outside customers', `${usd(m.allTime)} · ${plural(m.customers, 'payment')}${m.byTable.length ? small(list(m.byTable)) : ''}`),
+  ]) : ''}
+
+${g || p ? section('Installs and CLI', [
+    g && row('install.sh fetches', `${n(g.installs)} outside IPs (${n(g.shell)} from a shell, the rest a browser)${g.ps1 ? ` · ${n(g.ps1)} .ps1` : ''} · ${n(g.fetches)} fetches`),
+    p && row(`npm ${esc(NPM_PKG)}`, `${p.posted ? n(p.days[DAY]) : '· (npm has not posted the day yet)'}${p.posted ? vs(p.days[DAY], p.days[PREV]) : ''} · ${n(p.week)} in 7d · ${n(p.month)} in 30d${small('includes our own fleet upgrades and CI installs; npm does not say who')}`),
+    p && row('npm by version, last week', p.versions.length ? `${p.versions.slice(0, 6).map(([k, v]) => `${esc(k)} ${n(v)}`).join(' · ')}${p.versions.length > 6 ? ` · ${n(p.versions.length - 6)} older` : ''}` : 'none'),
+    g && row('CLI users (outside IPs)', `${n(g.cliUsers)}${r.newCli !== null ? ` · ${n(r.newCli)} new` : ''} · ${n(g.cliRequests)} requests${g.versions.length ? ` · ${list(g.versions)}` : ''}${small(cliKinds ? `by kind: ${cliKinds}` : 'the CLI sends no version; it is counted by Node’s default user agent on /api/')}`),
+    a && row('CLI logins (threatcrush login)', `${n(d.cliLogins)} that day · ${n(a.cliLoginsAll)} outside accounts ever`),
+    g && row('Left out', `${n(g.bots)} crawler and monitor requests · ${n(g.ours)} of our IPs`),
+  ]) : ''}
+
+${a ? section('Accounts and teams', [
+    row('threatcrush.com accounts', `${n(a.external)} outside · ${n(a.internal)} ours/QA · ${n(a.new7)} new in 7d · ${n(a.new30)} in 30d · ${n(a.confirmedAll)} ever confirmed`),
+    row('Signed up that day', `${n(d.signups)} (${n(d.confirmed)} confirmed)${vs(d.signups, a.days[PREV].signups)}${small(`last outside signup ${a.lastSignup ? esc(dayLabel(a.lastSignup, true)) : 'never'}`)}`),
+    row('Signed in', `${n(d.logins)} that day${vs(d.logins, a.days[PREV].logins)} · ${n(a.active30)} in 30 days`),
+    row('Orgs / teams / fleets (outside)', `${n(o.org.outside)} / ${n(o.team.outside)} / ${n(o.fleet.outside)} · new that day ${n(o.org.outsideDay)} / ${n(o.team.outsideDay)} / ${n(o.fleet.outsideDay)}${small(`all, ours included: ${n(o.org.all)} orgs · ${n(o.team.all)} teams · ${n(o.fleet.all)} fleets`)}`),
+    row('Invites and agent keys', `${n(o.invite.outsideDay)} invites sent · ${n(o.invite_accepted.outsideDay)} accepted that day (outside) · ${n(o.agent_key.outside)} outside agent keys (${n(o.agent_key.all)} all)`),
+  ]) : ''}
+
+${sv ? section('Servers and daemons', [
+    row('Servers online now', `${n(sv.outsideOnline)} outside of ${n(sv.outside)} · ${n(sv.online)} of ${n(sv.total)} all${sv.outsideNew ? ` · ${n(sv.outsideNew)} outside added that day` : ''}${sv.offline.length ? `<div style="font-size:11px;color:${DOWN}">ours offline: ${esc(sv.offline.join(', '))}</div>` : ''}${small('online = heartbeat in the last 15 minutes, as of generation')}`),
+    row('Daemon versions online', list(sv.versions)),
+    sv.outside ? row('Outside daemon versions', list(sv.outsideVersions)) : '',
+    g && row('Daemon heartbeats that day', `${n(g.outsideDaemons)} outside daemons · ${n(g.outsideBeats)} calls${small(`our fleet: ${g.oursBeats.length ? list(g.oursBeats) : 'none'} (ingest + ban claim + scan-run poll)`)}`),
+  ]) : ''}
+
+${b ? section('Scans', [
+    row('GitHub App installs', `${n(b.github.active)} active of ${n(b.github.all)} · ${n(b.github.newDay)} new that day${vs(b.github.newDay, b.github.newPrev)}${b.github.removedDay ? ` · ${n(b.github.removedDay)} removed` : ''}`),
+    row('GitHub repo scans', `${n(b.github.scansDay)} that day${vs(b.github.scansDay, b.github.scansPrev)} · ${n(b.github.scanFindingsDay)} findings${b.github.scansFailedDay ? ` · ${n(b.github.scansFailedDay)} failed` : ''} · ${n(b.github.scansAll)} all-time`),
+    row('Property runs (scheduled scans, pentests)', `${n(b.runs.day)} outside that day${vs(b.runs.day, b.runs.prev)} · ${n(b.runs.oursDay)} ours${b.runs.byType.length ? ` · ${list(b.runs.byType)}` : ''} · ${n(b.runs.outsideAll)} outside all-time (${n(b.runs.all)} all)`),
+    g && row('Web scans on threatcrush.com', `${n(g.webScans)} POST /api/scan from ${n(g.webScanners)} outside IPs`),
+    row('ai-scan / local scans', `not reported${small('threatcrush scan and ai-scan run on the user’s machine and send nothing home')}`),
+  ]) : ''}
+
+${at ? section('Attacks and bans across the fleet', [
+    row('Attack events (watchdog)', `${n(at.day.events)}${vs(at.day.events, at.prev.events)} · ${n(at.day.occurrences)} occurrences · ${n(at.day.ips)} source IPs${small(sev(at.day.severity))}`),
+    row('Top rules', at.rules.length ? at.rules.map(([k, v]) => `${esc(k)} ${n(v)}`).join('<br>') : 'none'),
+    row('By server', `${list(at.servers)}${at.outsideEvents ? '' : small('no customer servers reported attacks')}`),
+    row('Bans that day', `${n(at.rem.blocks)} blocks on ${n(at.rem.blockedIps)} IPs${vs(at.rem.blockedIps, at.remPrev.blockedIps)} · ${n(at.rem.unblocks)} expired/unblocked${at.rem.failed ? ` · <span style="color:${DOWN}">${n(at.rem.failed)} failed</span>` : ''}${at.rem.other.length ? ` · ${list(at.rem.other)}` : ''}`),
+    row('IPs banned at end of day', n(at.bannedNow)),
+  ]) : ''}
+
+${t ? section('threatcrush.com traffic', [
+    row('Visitors', `${n(td.visitors)} that day · ${n(t.visitors30)} in 30 days · ${n(td.pricing)} /pricing views · ${n(td.signupSubmits)} signup/login submits`),
+    row('Top pages', t.top.length ? t.top.map(([k, v]) => `${esc(k)} ${n(v)}`).join('<br>') : 'none'),
+    row('Referrers', t.refs.length ? t.refs.map((x) => `${esc(x.h)} ${n(x.n)}`).join(' · ') : 'none'),
+  ]) : ''}
+
+${meta.problems.length ? `<div style="font-size:12px;color:${DOWN};margin-top:12px"><b>Sources skipped:</b> ${meta.problems.map(esc).join('; ')}</div>` : ''}
+<div style="font-size:11px;color:${MUTE};margin-top:22px;border-top:1px solid ${LINE};padding-top:8px">Installs = distinct client IPs that fetched install.sh/ps1 from threatcrush.com that day, minus our boxes (${esc(OUR_IPS.length)} IPs, every server in our orgs, private ranges), crawlers and the w3bs package scanner; "never seen" / "new" compare hashed IPs with every earlier night. Revenue = settled (confirmed/forwarded) rows across the payment tables, minus credit-code grants, comp plans and our accounts. Accounts matching ${esc(INTERNAL)} are ours; orgs they created are ours, and so are those orgs' servers, attacks and runs. Generated by threatcrush-nightly on ${esc(hostname())} at ${esc(meta.generatedAt)}.</div>
+</td></tr></table></div>`;
+}
+
+function renderText(r, meta) {
+  const g = r.nginx, b = r.db, t = r.traffic, p = r.npm;
+  const a = b?.accounts, d = a?.days[DAY], m = b?.money, at = b?.attacks, sv = b?.servers, o = b?.orgs;
+  return [
+    `ThreatCrush nightly · ${dayLabel(DAY, true)}`,
+    '',
+    m?.firstEver ? `FIRST OUTSIDE PAYMENT EVER: ${usd(m.day.settled)}\n` : '',
+    verdict(r),
+    '',
+    m ? `Money: ${usd(m.day.settled)} settled (${m.day.payments}) · ${m.day.opened} checkouts opened · paid plans ${m.plans.length ? m.plans.map(([k, v]) => `${k} ${v}`).join(', ') : 'none'} · all-time ${usd(m.allTime)}` : '',
+    g ? `Installs (outside IPs): ${n(g.installs)}${g.complete ? '' : ' (log incomplete)'} · CLI users ${n(g.cliUsers)} · outside daemons ${n(g.outsideDaemons)}` : '',
+    p ? `npm ${NPM_PKG}: ${p.posted ? n(p.days[DAY]) : 'not posted yet'} · ${n(p.week)} in 7d · versions ${p.versions.slice(0, 4).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}` : '',
+    t ? `Visitors: ${n(t.days[DAY].visitors)} (${n(t.days[DAY].views)} views) · ${n(t.visitors30)} in 30 days` : '',
+    a ? `Accounts: ${n(a.external)} outside · ${n(d.signups)} signups · ${n(d.logins)} logins · ${n(d.cliLogins)} CLI logins` : '',
+    o ? `Orgs/teams/fleets outside: ${n(o.org.outside)}/${n(o.team.outside)}/${n(o.fleet.outside)}` : '',
+    sv ? `Servers online: ${n(sv.outsideOnline)} outside of ${n(sv.outside)} · ${n(sv.online)}/${n(sv.total)} all · ${sv.versions.map(([k, v]) => `${k} ${v}`).join(', ')}` : '',
+    b ? `Scans: GitHub App ${n(b.github.active)} active, ${n(b.github.scansDay)} repo scans · ${n(b.runs.day)} outside property runs` : '',
+    at ? `Attacks: ${n(at.day.events)} events from ${n(at.day.ips)} IPs · bans ${n(at.rem.blocks)} on ${n(at.rem.blockedIps)} IPs · ${n(at.bannedNow)} banned at end of day` : '',
+    meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+function subjectLine(r) {
+  const g = r.nginx, b = r.db, t = r.traffic, m = b?.money;
+  const parts = [
+    m ? `${usd(m.day.settled)} revenue` : null,
+    g ? plural(g.installs, 'install') : 'installs unknown',
+    t ? plural(t.days[DAY].visitors, 'visitor') : null,
+    b ? plural(b.accounts.days[DAY].signups, 'signup') : null,
+    b ? `${n(b.attacks.rem.blockedIps)} IPs banned` : null,
+  ].filter(Boolean);
+  return `${m?.firstEver ? 'FIRST PAYMENT · ' : ''}ThreatCrush ${dayLabel(DAY)}: ${parts.join(', ')}`;
+}
+
+// ---------------------------------------------------------------- main
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+async function main() {
+  const t0 = Date.now();
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name} (${e.message.slice(0, 160)})`); return null; } };
+  const [raw, dbr, npmr, trf] = await Promise.all([
+    settle('nginx', nginxRows), settle('db', db), settle('npm', npm), settle('traffic', traffic),
+  ]);
+  if (!raw && !dbr && !npmr && !trf) throw new Error(`no source answered:\n  ${problems.join('\n  ')}`);
+  const ours = new Set([...OUR_IPS, ...(dbr?.ourIps || [])]);
+  const ngx = raw ? summariseNginx(raw, ours, dbr?.serverByIp || {}) : null;
+
+  const hist = history();
+  const earlier = Object.entries(hist).filter(([x]) => x < DAY);
+  const seenInst = new Set(earlier.flatMap(([, h]) => h.installerHashes || []));
+  const seenCli = new Set(earlier.flatMap(([, h]) => h.cliHashes || []));
+  const newInstallers = ngx && earlier.length ? ngx.installerHashes.filter((h) => !seenInst.has(h)).length : null;
+  const newCli = ngx && earlier.length ? ngx.cliHashes.filter((h) => !seenCli.has(h)).length : null;
+
+  const snap = {
+    day: DAY,
+    installs: ngx?.installs, installsComplete: ngx?.complete, installerHashes: ngx?.installerHashes,
+    cliUsers: ngx?.cliUsers, cliHashes: ngx?.cliHashes, outsideDaemons: ngx?.outsideDaemons,
+    npm: npmr?.days[DAY], visitors: trf?.days[DAY].visitors, signups: dbr?.accounts.days[DAY].signups,
+    external: dbr?.accounts.external, revenue: dbr?.money.day.settled,
+    attacks: dbr?.attacks.day.events, bannedIps: dbr?.attacks.rem.blockedIps,
+    serversOnline: dbr?.servers.online, outsideServers: dbr?.servers.outside,
+  };
+  const series = {};
+  for (const x of [PREV, ...DAYS]) {
+    const h = x === DAY ? snap : hist[x];
+    if (h && h.installs !== undefined && h.installs !== null) series[x] = { installs: h.installs, cliUsers: h.cliUsers };
+  }
+  const r = { nginx: ngx, db: dbr, npm: npmr, traffic: trf, series, newInstallers, newCli };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', problems };
+  const html = renderHtml(r, meta), text = renderText(r, meta), subject = subjectLine(r);
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(join(DATA_DIR, 'out'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'out', 'latest.html'), html);
+  writeFileSync(join(DATA_DIR, 'out', 'latest.txt'), text);
+  // A later --day rerun after the log rotated must not wipe the night's install counts.
+  if (ngx || !hist[DAY]) writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify(snap));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(DATA_DIR, 'out', 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(key, { from: FROM, to: TO, subject, html, text });
+  console.log(`sent ${id} to ${TO.join(', ')}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`threatcrush-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = resendKey();
+      if (key) await resend(key, { from: FROM, to: TO, subject: 'ThreatCrush nightly FAILED', text: `The ThreatCrush report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`threatcrush-nightly: could not mail the failure either: ${e2.message}`); }
+    // And a text or call (bin/alert), since a failure email can fail the same way.
+    try {
+      execFileSync('alert', ['--key', 'threatcrush-nightly', '--every', '12h', `threatcrush-nightly failed for ${DAY}: ${String(e && e.message || e).slice(0, 200)}`], { stdio: 'ignore', timeout: 120_000 });
+    } catch { console.error('threatcrush-nightly: alert failed too'); }
+  }
+  process.exit(1);
+});
