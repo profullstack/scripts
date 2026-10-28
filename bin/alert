@@ -20,6 +20,9 @@
 # about the key without alerting anyone and sends that same email when it is
 # rejected, so a revoked key is found by cron, not by the next real outage.
 #
+# The vault key is cached in ~/.local/state/alert/smshub-key (0600) and used
+# when the vault cannot be read, so a logicsrc outage does not silence alerts.
+#
 # Exit 0 when sent or deliberately skipped, 1 when nothing went out.
 # Log: ~/.local/state/alert/alert.log
 set -uo pipefail
@@ -75,6 +78,17 @@ for r in csv.DictReader(open(sys.argv[1])):
     if r["key"]=="SMSHUB_ALERT_API_KEY": print(r["value"])' "$tmp/v.csv")
   fi
   rm -rf "$tmp"
+  # The vault (app.logicsrc.com) lives on the same box this script watches, so it
+  # is down exactly when alerts matter most. Keep the last key it gave us (0600)
+  # and use that when it cannot answer; a key smshub rejects is still caught below.
+  cache="$STATE/smshub-key"
+  if [ -n "$apikey" ]; then
+    [ "$(cat "$cache" 2>/dev/null)" = "$apikey" ] || (umask 077; printf '%s\n' "$apikey" >"$cache.tmp" && mv "$cache.tmp" "$cache")
+  elif [ -s "$cache" ]; then
+    apikey=$(cat "$cache")
+    keysrc="the cached copy $cache (vault smshub--prod did not answer)"
+    log "vault unreachable or key missing: using cached smshub key"
+  fi
 fi
 
 email() { # subject body

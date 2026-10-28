@@ -56,4 +56,19 @@ run bad --check; rc=$?
 run bad --check; [ ! -s "$tmp/home/mail.out" ] && ok "--check: one key email per 6h" || bad "--check repeated email"
 run good --check && [ ! -f "$tmp/home/.local/state/alert/smshub-key-broken.last" ] && ok "--check on good key: exit 0, clears" || bad "--check good"
 
+
+# Vault outage: the last key the vault gave is cached and used. No logicsrc in
+# this HOME means "vault did not answer"; a fake logicsrc stands in for the vault.
+: >"$tmp/home/mail.out"; rm -f "$tmp/home/.local/state/alert/"*.last
+cat >"$tmp/home/.local/bin/logicsrc" <<'L'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do [ "$1" = -o ] && { printf 'team,project,env,category,key,value,updated_at\np,smshub,prod,,SMSHUB_ALERT_API_KEY,good,\n' >"$2"; }; shift; done
+L
+chmod +x "$tmp/home/.local/bin/logicsrc"
+vrun() { HOME="$tmp/home" PATH="$tmp/home/.local/bin:$PATH" "$root/bin/alert" "$@" >/dev/null 2>&1; }
+vrun --key v1 "vault up" && [ "$(stat -c %a "$tmp/home/.local/state/alert/smshub-key")" = 600 ] && ok "vault key used and cached 0600" || bad "vault key cache"
+rm "$tmp/home/.local/bin/logicsrc"
+vrun --key v2 "vault down" && [ ! -s "$tmp/home/mail.out" ] && grep -q 'using cached smshub key' "$tmp/home/.local/state/alert/alert.log" \
+  && ok "vault down: cached key still calls, no email" || bad "vault down: $(mailed)"
+
 exit $fails
