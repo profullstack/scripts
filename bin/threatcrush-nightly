@@ -132,7 +132,10 @@ async function pg(url, queries) {
     const [ro] = await sql.unsafe("show transaction_read_only");
     if (ro.transaction_read_only !== "on") throw new Error("not read-only");
     const qs = JSON.parse(process.env.QUERIES), out = {};
-    for (const [k, q] of Object.entries(qs)) out[k] = await sql.unsafe(q.sql, q.params || []);
+    for (const [k, q] of Object.entries(qs)) {
+      try { out[k] = await sql.unsafe(q.sql, q.params || []); }
+      catch (e) { if (!q.optional) throw e; out[k] = null; }
+    }
     console.log(JSON.stringify(out));
     await sql.close();`;
   const out = await run('bun', ['-e', script], { env: { DBURL: url.replace(/sslmode=no-verify/, 'sslmode=require'), QUERIES: JSON.stringify(queries) }, timeout: 180_000 });
@@ -275,6 +278,10 @@ async function db() {
     ghScansAll: { sql: `select count(*)::int n from github_repo_scans` },
     runs: { sql: `select created_at::date::text d, type, status, (org_id in ${OURS_O}) ours from property_runs where created_at >= $1::date - 1 and created_at < $1::date + 1`, params: [DAY] },
     runsAll: { sql: `select count(*)::int n, count(*) filter (where org_id not in ${OURS_O})::int outside from property_runs` },
+    // Anonymous ai-scan usage pings (CLI 0.13.53+); the table is absent on older deploys.
+    aiscan: { sql: `select created_at::date::text d, event, version v, ci, install_id::text i, findings f, failed
+        from cli_usage_pings where created_at >= $1::date - 1 and created_at < $1::date + 1`, params: [DAY], optional: true },
+    aiscanAll: { sql: `select count(*)::int n, count(distinct install_id)::int installs, min(created_at)::date::text since from cli_usage_pings`, optional: true },
     det: { sql: `select detected_at::date::text d, severity, count(*)::int n, sum(coalesce(occurrences, 1))::int occ,
         count(distinct source_ip)::int ips from detections where detected_at >= $1::date - 1 and detected_at < $1::date + 1 group by 1, 2`, params: [DAY] },
     detIps: { sql: `select detected_at::date::text d, count(distinct source_ip)::int ips from detections
@@ -376,6 +383,17 @@ async function db() {
       byType: countBy(q.runs.filter((r) => r.d === DAY), (r) => r.type || '?'),
       all: q.runsAll[0].n, outsideAll: q.runsAll[0].outside,
     },
+    aiscan: q.aiscan && (() => {
+      const day = q.aiscan.filter((r) => r.d === DAY), prev = q.aiscan.filter((r) => r.d === PREV);
+      const people = day.filter((r) => !r.ci);
+      return {
+        runs: day.length, prevRuns: prev.length, ci: day.filter((r) => r.ci).length,
+        installs: new Set(people.map((r) => r.i)).size, prevInstalls: new Set(prev.filter((r) => !r.ci).map((r) => r.i)).size,
+        scripts: day.filter((r) => r.event === 'ai-scan-run').length, failed: day.filter((r) => r.failed).length,
+        findings: sum(day, (r) => r.f), versions: countBy(day, (r) => r.v || '?'),
+        all: q.aiscanAll?.[0]?.n ?? 0, allInstalls: q.aiscanAll?.[0]?.installs ?? 0, since: q.aiscanAll?.[0]?.since ?? null,
+      };
+    })(),
     attacks: {
       day: detDay(DAY), prev: detDay(PREV), rules: q.detRules.map((r) => [r.r, r.n]),
       servers: q.detServers.map((r) => [r.ours ? r.s : `${r.s} (customer)`, r.n]),
@@ -535,7 +553,9 @@ ${b ? section('Scans', [
     row('GitHub repo scans', `${n(b.github.scansDay)} that day${vs(b.github.scansDay, b.github.scansPrev)} · ${n(b.github.scanFindingsDay)} findings${b.github.scansFailedDay ? ` · ${n(b.github.scansFailedDay)} failed` : ''} · ${n(b.github.scansAll)} all-time`),
     row('Property runs (scheduled scans, pentests)', `${n(b.runs.day)} outside that day${vs(b.runs.day, b.runs.prev)} · ${n(b.runs.oursDay)} ours${b.runs.byType.length ? ` · ${list(b.runs.byType)}` : ''} · ${n(b.runs.outsideAll)} outside all-time (${n(b.runs.all)} all)`),
     g && row('Web scans on threatcrush.com', `${n(g.webScans)} POST /api/scan from ${n(g.webScanners)} outside IPs`),
-    row('ai-scan / local scans', `not reported${small('threatcrush scan and ai-scan run on the user’s machine and send nothing home')}`),
+    b.aiscan ? row('ai-scan runs (anonymous usage pings)', `${n(b.aiscan.runs)}${vs(b.aiscan.runs, b.aiscan.prevRuns)} from ${plural(b.aiscan.installs, 'install')} · ${n(b.aiscan.ci)} in CI${b.aiscan.scripts ? ` · ${n(b.aiscan.scripts)} .mosh scripts` : ''} · ${n(b.aiscan.findings)} findings${b.aiscan.failed ? ` · ${n(b.aiscan.failed)} failed` : ''}${b.aiscan.versions.length ? ` · ${list(b.aiscan.versions)}` : ''}${small(`${n(b.aiscan.all)} runs from ${n(b.aiscan.allInstalls)} installs since ${b.aiscan.since ? esc(dayLabel(b.aiscan.since, true)) : 'the ping shipped (CLI 0.13.53, Oct 28)'} · opt-out, so users with THREATCRUSH_TELEMETRY=0 or DO_NOT_TRACK are missing · can include our own runs`)}`)
+      : row('ai-scan runs', `not reported${small('cli_usage_pings table missing')}`),
+    row('Local scans (threatcrush scan)', `not reported${small('runs on the user’s machine and sends nothing home')}`),
   ]) : ''}
 
 ${at ? section('Attacks and bans across the fleet', [
@@ -573,7 +593,7 @@ function renderText(r, meta) {
     a ? `Accounts: ${n(a.external)} outside · ${n(d.signups)} signups · ${n(d.logins)} logins · ${n(d.cliLogins)} CLI logins` : '',
     o ? `Orgs/teams/fleets outside: ${n(o.org.outside)}/${n(o.team.outside)}/${n(o.fleet.outside)}` : '',
     sv ? `Servers online: ${n(sv.outsideOnline)} outside of ${n(sv.outside)} · ${n(sv.online)}/${n(sv.total)} all · ${sv.versions.map(([k, v]) => `${k} ${v}`).join(', ')}` : '',
-    b ? `Scans: GitHub App ${n(b.github.active)} active, ${n(b.github.scansDay)} repo scans · ${n(b.runs.day)} outside property runs` : '',
+    b ? `Scans: GitHub App ${n(b.github.active)} active, ${n(b.github.scansDay)} repo scans · ${n(b.runs.day)} outside property runs · ai-scan ${b.aiscan ? `${n(b.aiscan.runs)} runs from ${n(b.aiscan.installs)} installs` : 'not reported'}` : '',
     at ? `Attacks: ${n(at.day.events)} events from ${n(at.day.ips)} IPs · bans ${n(at.rem.blocks)} on ${n(at.rem.blockedIps)} IPs · ${n(at.bannedNow)} banned at end of day` : '',
     meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
   ].filter((l) => l !== '').join('\n');

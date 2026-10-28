@@ -486,8 +486,10 @@ and daemon versions, GitHub App installs and repo scans, property runs, and the
 fleet's attack events (detections) and bans (remediation_actions) come from the
 threatcrush.com Supabase Postgres on dev2, read-only; visitors from CrawlProof.
 Accounts matching the internal regex are ours, and so are the orgs they created
-and those orgs' servers. `ai-scan` and local scans send nothing home, so they are
-not counted.
+and those orgs' servers. ai-scan runs come from the CLI's anonymous usage ping
+(`cli_usage_pings`, CLI 0.13.53+, opt-out with `THREATCRUSH_TELEMETRY=0`), split
+into people (distinct install ids) and CI; `threatcrush scan` sends nothing
+home, so local scans are not counted.
 
 ```
 threatcrush-nightly                     mail yesterday's (UTC) report
