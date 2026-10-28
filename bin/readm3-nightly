@@ -1,0 +1,413 @@
+#!/usr/bin/env node
+// readm3-nightly — one email a night: readm3.com usage and limits (the numbers behind
+// the viewer's "Usage and limits" dialog, for every account), the money the pay-as-you-go
+// balance moved, and how the surfaces were used (web, CLI/MCP, desktop, npm, pastes).
+//
+//   readm3-nightly                    send the report for yesterday (UTC)
+//   readm3-nightly --dry-run          build it, write it under the data dir, send nothing
+//   readm3-nightly --day 2026-10-27   report a specific UTC day
+//   readm3-nightly --to a@b.com,c@d   someone else (default anthony@ + preshy@profullstack.com)
+//
+// Sources, each of which may fail on its own and is then named in the email:
+//   readm3   the prod SQLite on dev2 (READM3_SQLITE, default the compose volume), opened
+//            read-only. Stored = SUM(blobs.stored), exactly what the dialog shows; the
+//            file COUNT lives only inside each sealed (E2E) workspace, so the server can
+//            only count stored files (blobs). Balance = SUM(billing_ledger.amountMicros).
+//            Paths and summary text never leave the query.
+//   npm      api.npmjs.org daily downloads of @profullstack/readm3.
+//   desktop  GitHub release asset download counts (cumulative; the day's change is the
+//            difference from the last snapshot under days/).
+//   traffic  the CrawlProof tracker rollups of readm3.com (CRAWLPROOF_DB_URL).
+// Secrets: RESEND_API_KEY and CRAWLPROOF_DB_URL from the team vault fleet-nightly--prod.
+
+import { execFile, execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  join(homedir(), '.bun/bin'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+  process.env.PATH || '',
+].join(':');
+
+const DATA_DIR = process.env.READM3_NIGHTLY_DATA || join(homedir(), '.local/share/readm3-nightly');
+const SQLITE = process.env.READM3_SQLITE || join(homedir(), 'www/readm3.com/volumes/readm3-volume/readm3.sqlite');
+const SITE = 'readm3.com';
+const NPM = '@profullstack/readm3';
+const REPO = 'profullstack/readm3';
+const DEFAULT_FROM = 'readm3 nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'anthony@profullstack.com,preshy@profullstack.com';
+// The plan, as src/blob-store.ts has it (prod sets no READM3_FREE_STORAGE_BYTES override).
+const GiB = 1024 ** 3;
+const FREE_BYTES = Number(process.env.READM3_FREE_STORAGE_BYTES) || 5 * GiB;
+const MICROS_PER_GIB_MONTH = Number(process.env.READM3_STORAGE_MICROS_PER_GB_MONTH) || 50_000;
+const MAX_FILE_BYTES = 5 * GiB;
+const MAX_FILES = 1_000_000;
+const STRIP_DAYS = 7;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = (opt('--to') || process.env.READM3_REPORT_TO || DEFAULT_TO).split(',').map((s) => s.trim()).filter(Boolean);
+const FROM = process.env.READM3_REPORT_FROM || DEFAULT_FROM;
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(DAY, i - STRIP_DAYS + 1));
+const FROM7 = addDays(DAY, -6), FROM30 = addDays(DAY, -29);
+const END_ISO = `${addDays(DAY, 1)}T00:00:00.000Z`; // end of the reported day
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  const p = execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000, env: { ...process.env, ...opts.env } }, (err, out, errOut) =>
+    err ? reject(new Error(`${cmd}: ${(errOut || err.message).trim().split('\n').slice(-3).join(' ')}`)) : resolve(out));
+  if (opts.input) { p.stdin.end(opts.input); }
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+let vaultCache;
+function vault() {
+  if (vaultCache) return vaultCache;
+  vaultCache = {};
+  const dir = mkdtempSync(join(tmpdir(), 'readm3-nightly-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', 'fleet-nightly', 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    vaultCache = parseEnv(readFileSync(join(dir, 'env'), 'utf8'));
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  return vaultCache;
+}
+const secret = (k) => process.env[k] || vault()[k];
+
+function resendKey() {
+  const k = secret('RESEND_API_KEY');
+  if (k) return k;
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+/** Named read-only queries against one Postgres, through Bun's client. */
+async function pg(url, queries) {
+  const script = `
+    import { SQL } from "bun";
+    const sql = new SQL(process.env.DBURL);
+    await sql.unsafe("set session characteristics as transaction read only");
+    const [ro] = await sql.unsafe("show transaction_read_only");
+    if (ro.transaction_read_only !== "on") throw new Error("not read-only");
+    const qs = JSON.parse(process.env.QUERIES), out = {};
+    for (const [k, q] of Object.entries(qs)) out[k] = await sql.unsafe(q.sql, q.params || []);
+    console.log(JSON.stringify(out));
+    await sql.close();`;
+  const out = await run('bun', ['-e', script], { env: { DBURL: url, QUERIES: JSON.stringify(queries) }, timeout: 90_000 });
+  return JSON.parse(out.trim().split('\n').pop());
+}
+
+/** One read-only query against the readm3 SQLite (WAL, so live writes are fine). */
+async function lite(sql) {
+  const out = await run('sqlite3', ['-readonly', '-json', SQLITE, sql], { timeout: 60_000 });
+  return out.trim() ? JSON.parse(out) : [];
+}
+
+const dayOf = (t) => (t ? new Date(t).toISOString().slice(0, 10) : null);
+const sum = (xs, f = (x) => x) => xs.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+
+// ---------------------------------------------------------------- sources
+
+/** Accounts, storage, balances and the ledger. No email, path or summary text leaves the queries. */
+async function readm3() {
+  if (!existsSync(SQLITE)) throw new Error(`no database at ${SQLITE}`);
+  const [users, store, ledger, topups, snaps, logins, pastes, shares] = await Promise.all([
+    lite(`select id, admin, createdAt from users`),
+    lite(`select userId, count(*) blobs, coalesce(sum(stored),0) stored, max(size) largest, sum(complete=0) partial,
+            sum(createdAt < '${END_ISO}' and createdAt >= '${DAY}') added, coalesce(sum(case when createdAt >= '${DAY}' and createdAt < '${END_ISO}' then stored end),0) addedBytes
+          from blobs group by 1`),
+    lite(`select userId, kind, substr(ref, 1, instr(ref, ':') - 1) what, amountMicros m, arm, createdAt from billing_ledger where createdAt < '${END_ISO}'`),
+    lite(`select userId, status, amountMicros m, chain, createdAt, paidAt from billing_topups where createdAt < '${END_ISO}'`),
+    lite(`select userId, max(revision) revision, max(savedAt) lastSync, sum(savedAt >= '${DAY}' and savedAt < '${END_ISO}') syncs from snapshots group by 1`),
+    lite(`select userId, kind, createdAt from sessions where createdAt >= '${FROM30}'`),
+    lite(`select createdAt, bytes, language from pastes where createdAt >= '${FROM30}'`),
+    lite(`select count(*) n, sum(createdAt >= '${DAY}' and createdAt < '${END_ISO}') today from shares`),
+  ]);
+  const byUser = (rows) => rows.reduce((a, r) => ((a[r.userId] ||= []).push(r), a), {});
+  const led = byUser(ledger);
+  const accounts = users.map((u) => {
+    const s = store.find((r) => r.userId === u.id) || { blobs: 0, stored: 0, largest: 0, partial: 0, added: 0, addedBytes: 0 };
+    const l = led[u.id] || [];
+    const balance = sum(l, (r) => r.m);
+    const over = Math.max(0, s.stored - FREE_BYTES);
+    const snap = snaps.find((r) => r.userId === u.id);
+    const today = l.filter((r) => dayOf(r.createdAt) === DAY);
+    return {
+      id: u.id, ours: !!u.admin, created: dayOf(u.createdAt),
+      plan: over > 0 || balance > 0 ? 'Free account, pay as you go' : 'Free account',
+      blobs: s.blobs, partial: s.partial, stored: s.stored, largest: s.largest, addedBlobs: s.added, addedBytes: s.addedBytes,
+      share: s.stored / FREE_BYTES, over,
+      // What the hourly charge takes at this size, per month.
+      monthly: (over / GiB) * MICROS_PER_GIB_MONTH / 1e6,
+      balance: balance / 1e6,
+      storageCharged: -sum(today.filter((r) => r.what === 'storage'), (r) => r.m) / 1e6,
+      spentToday: -sum(today.filter((r) => r.kind === 'charge'), (r) => r.m) / 1e6,
+      syncs: snap?.syncs ?? 0, lastSync: snap?.lastSync ? dayOf(snap.lastSync) : null, revision: snap?.revision ?? 0,
+    };
+  }).sort((a, b) => b.stored - a.stored);
+
+  const per = (d) => {
+    const on = (r) => dayOf(r.createdAt) === d;
+    const charges = ledger.filter((r) => r.kind === 'charge' && on(r));
+    return {
+      signups: users.filter(on).length,
+      logins: logins.filter((r) => on(r) && r.kind === 'browser').length,
+      apiTokens: logins.filter((r) => on(r) && r.kind !== 'browser').length,
+      topupsPaid: sum(topups.filter((r) => r.status === 'paid' && dayOf(r.paidAt) === d), (r) => r.m) / 1e6,
+      topupsOpened: topups.filter(on).length,
+      storageUsd: -sum(charges.filter((r) => r.what === 'storage'), (r) => r.m) / 1e6,
+      summariesFree: charges.filter((r) => r.what === 'free-summary').length,
+      summariesPaid: charges.filter((r) => r.what !== 'free-summary' && r.what !== 'storage' && r.what !== 'listen').length,
+      listens: charges.filter((r) => r.what === 'listen').length,
+      spentUsd: -sum(charges, (r) => r.m) / 1e6,
+      pastes: pastes.filter(on).length,
+    };
+  };
+  const total = (k) => sum(accounts, (a) => a[k]);
+  return {
+    accounts,
+    days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])),
+    totals: {
+      accounts: accounts.length, outside: accounts.filter((a) => !a.ours).length,
+      stored: total('stored'), blobs: total('blobs'), balance: total('balance'), monthly: total('monthly'),
+      overFree: accounts.filter((a) => a.over > 0).length, near: accounts.filter((a) => a.share >= 0.8 && a.over === 0).length,
+      largest: Math.max(0, ...accounts.map((a) => a.largest || 0)),
+      topupsAll: sum(topups.filter((r) => r.status === 'paid'), (r) => r.m) / 1e6,
+      pendingTopups: topups.filter((r) => r.status === 'pending').length,
+      shares: shares[0]?.n ?? 0, sharesToday: shares[0]?.today ?? 0,
+      pastes7: pastes.filter((r) => dayOf(r.createdAt) >= FROM7 && dayOf(r.createdAt) <= DAY).length,
+      pastes30: pastes.filter((r) => dayOf(r.createdAt) <= DAY).length,
+    },
+  };
+}
+
+/** npm downloads per day for the last week (0 for a day npm has not posted yet). */
+async function npm() {
+  const r = await fetch(`https://api.npmjs.org/downloads/range/${FROM30}:${DAY}/${NPM}`);
+  if (!r.ok) throw new Error(`npm ${r.status}`);
+  const j = await r.json();
+  const at = (d) => j.downloads?.find((x) => x.day === d)?.downloads ?? 0;
+  // npm posts a day hours late and reads 0 until then; null prints as "not posted yet".
+  const day = at(DAY) === 0 && at(PREV) > 0 ? null : at(DAY);
+  return { day, prev: at(PREV), d7: sum(j.downloads.filter((x) => x.day >= FROM7), (x) => x.downloads), d30: sum(j.downloads, (x) => x.downloads) };
+}
+
+/** Desktop downloads: GitHub release asset counts are cumulative, so diff against the last snapshot. */
+async function desktop() {
+  const out = await run('gh', ['api', '--paginate', `repos/${REPO}/releases`, '--jq', '.[] | .assets[] | [.name, .download_count] | @tsv'], { timeout: 60_000 });
+  const kinds = { AppImage: 0, Flatpak: 0, Mac: 0, Windows: 0 };
+  for (const line of out.trim().split('\n').filter(Boolean)) {
+    const [name, count] = line.split('\t');
+    const k = /\.AppImage$/i.test(name) ? 'AppImage' : /\.flatpak$/i.test(name) ? 'Flatpak' : /\.dmg$|mac.*\.zip$|darwin/i.test(name) ? 'Mac' : /\.exe$|win.*\.zip$/i.test(name) ? 'Windows' : null;
+    if (k) kinds[k] += Number(count) || 0;
+  }
+  const all = sum(Object.values(kinds));
+  const prevFile = join(DATA_DIR, 'days', `${PREV}.json`);
+  const before = existsSync(prevFile) ? JSON.parse(readFileSync(prevFile, 'utf8')).desktopAll : undefined;
+  return { kinds, all, day: before === undefined ? null : all - before };
+}
+
+async function traffic() {
+  const url = secret('CRAWLPROOF_DB_URL');
+  if (!url) throw new Error('no CRAWLPROOF_DB_URL');
+  const host = SITE.replace(/\./g, '\\.');
+  const proj = await pg(url, { p: { sql: `select id::text id from projects where url ~* $1 and archived_at is null order by tracker_enabled desc nulls last, created_at limit 1`, params: [`^https?://(www\\.)?${host}(/|$)`] } });
+  const id = proj.p[0]?.id;
+  if (!id) throw new Error(`no tracker project for ${SITE}`);
+  const db = await pg(url, {
+    ev: { sql: `select day::text d, page_path p, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and event = 'pageview' and day between $2 and $3 group by 1, 2`, params: [id, addDays(FROM30, -1), DAY] },
+    vis: { sql: `select day::text d, count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1`, params: [id, addDays(FROM30, -1), DAY] },
+  });
+  const per = (d) => ({ visitors: db.vis.find((r) => r.d === d)?.v ?? 0, views: sum(db.ev.filter((r) => r.d === d), (r) => r.n) });
+  const top = Object.entries(db.ev.filter((r) => r.d === DAY).reduce((a, r) => ((a[r.p] = (a[r.p] || 0) + r.n), a), {}))
+    .sort((a, b) => b[1] - a[1]).slice(0, 6);
+  return { days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])), v30: sum(db.vis.filter((r) => r.d >= FROM30), (r) => r.v), top };
+}
+
+// ---------------------------------------------------------------- render
+
+const INK = '#0b0b0b', MUTE = '#52514e', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', BLUE = '#2a78d6', AMBER = '#b54708';
+const n = (v) => (v === null || v === undefined ? '·' : Number(v).toLocaleString('en-US'));
+const usd = (v) => (v === null || v === undefined ? '·' : `$${Number(v).toFixed(2)}`);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const signed = (d, f = n) => (d > 0 ? `+${f(d)}` : d < 0 ? `-${f(-d)}` : '±0');
+const plural = (k, word, many = `${word}s`) => `${n(k)} ${k === 1 ? word : many}`;
+// The same units the viewer's dialog prints (formatStorage in src/blob-store.ts).
+const bytes = (b) => (b >= GiB ? `${(b / GiB).toFixed(b >= 10 * GiB ? 0 : 1)} GB` : b >= 1024 * 1024 ? `${(b / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(b / 1024)} KB`);
+const pctOf = (x) => `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
+const who = (a) => `${a.ours ? 'ours' : 'outside'} ${a.id.slice(0, 6)}…`;
+
+function verdict(r) {
+  const s = r.readm3;
+  if (!s) return 'The readm3 database was unreadable tonight, so there are no usage numbers.';
+  const t = s.totals, d = s.days[DAY];
+  return `${bytes(t.stored)} stored across ${plural(t.accounts, 'account')} (${n(t.outside)} outside), ` +
+    `${t.overFree ? `${plural(t.overFree, 'account')} over the free 5 GB, accruing ${usd(t.monthly)}/mo` : 'nobody over the free 5 GB'}; ` +
+    `${usd(d.spentUsd)} drawn from balances on ${dayLabel(DAY)}, ${usd(d.topupsPaid)} added; balances hold ${usd(t.balance)}. ` +
+    `${plural(d.signups, 'signup')}, ${plural(d.logins, 'web sign-in')}${r.traffic ? `, ${n(r.traffic.days[DAY].visitors)} visitors` : ''}.`;
+}
+
+function renderHtml(r, meta) {
+  const s = r.readm3, t = r.traffic, np = r.npm, dk = r.desktop;
+  const d = s?.days[DAY], dp = s?.days[PREV];
+  const tile = (label, cur, prev, sub, fmt = n) => `<td style="width:25%;background:#f4f4f2;border-radius:8px;padding:10px 12px;vertical-align:top">
+<div style="font-size:12px;color:${MUTE}">${label}</div>
+<div style="font-size:24px;font-weight:700;margin-top:2px">${fmt(cur)}</div>
+<div style="font-size:12px;color:${prev === null || prev === undefined || cur === null ? MUTE : cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev === null || prev === undefined || cur === null ? '&nbsp;' : `${signed(cur - prev, fmt === usd ? usd : n)} vs ${esc(dayLabel(PREV))}`}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:4px">${sub}</div></td>`;
+  const h = (txt) => `<h2 style="font-size:14px;margin:22px 0 8px;border-bottom:1px solid ${LINE};padding-bottom:4px">${txt}</h2>`;
+  const meter = (share) => {
+    const color = share >= 1 ? DOWN : share >= 0.8 ? AMBER : BLUE;
+    const w = share > 0 ? Math.max(2, Math.min(100, Math.round(share * 100))) : 0;
+    return `<div style="background:${LINE};border-radius:4px;height:8px;width:120px"><div style="background:${color};border-radius:4px;height:8px;width:${w}%"></div></div>`;
+  };
+  const td = (x, right) => `<td style="padding:6px 8px;border-bottom:1px solid ${LINE};${right ? 'text-align:right;' : ''}font-size:13px">${x}</td>`;
+  const th = (x, right) => `<th style="padding:6px 8px;border-bottom:1px solid ${LINE};${right ? 'text-align:right;' : 'text-align:left;'}font-size:12px;color:${MUTE};font-weight:600">${x}</th>`;
+
+  const accounts = s ? `<table style="width:100%;border-collapse:collapse">
+<tr>${th('Account')}${th('Plan')}${th('Stored of 5 GB free')}${th('', false)}${th('Stored files', true)}${th('Largest', true)}${th('Over-free cost', true)}${th('Balance', true)}${th('Synced', true)}</tr>
+${s.accounts.map((a) => `<tr>${td(esc(who(a)))}${td(esc(a.plan))}${td(`${esc(bytes(a.stored))} <span style="color:${MUTE}">(${pctOf(a.share)})</span>`)}${td(meter(a.share))}${td(`${n(a.blobs)}${a.addedBlobs ? ` <span style="color:${UP}">+${n(a.addedBlobs)}</span>` : ''}${a.partial ? ` <span style="color:${AMBER}">(${n(a.partial)} partial)</span>` : ''}`, true)}${td(a.largest ? esc(bytes(a.largest)) : '·', true)}${td(a.over ? `${usd(a.monthly)}/mo` : '$0', true)}${td(usd(a.balance), true)}${td(a.lastSync ? `${esc(a.lastSync)}${a.syncs ? ` <span style="color:${UP}">×${n(a.syncs)}</span>` : ''}` : 'never', true)}</tr>`).join('\n')}
+</table>
+<p style="font-size:12px;color:${MUTE};margin:6px 0 0">Limits per account: ${n(MAX_FILES)} files, ${bytes(MAX_FILE_BYTES)} per file, ${bytes(FREE_BYTES)} stored free, then ${usd(MICROS_PER_GIB_MONTH / 1e6)} per GB a month charged hourly from the balance. "Stored files" are the ones kept encrypted on the server (files over 4 MB, plus small text spilled out of a big workspace); the workspace file count (the dialog's "Files") is sealed end-to-end, so only the browser knows it.</p>` : '';
+
+  const strip = s ? `<table style="width:100%;border-collapse:collapse;margin-top:8px"><tr>${th('Day')}${th('Signups', true)}${th('Web sign-ins', true)}${th('CLI/MCP tokens', true)}${th('Summaries (free+paid)', true)}${th('Listens', true)}${th('Pastes', true)}${th('Drawn', true)}${th('Added', true)}${t ? th('Visitors', true) : ''}</tr>
+${DAYS.slice().reverse().map((x) => { const v = s.days[x]; return `<tr>${td(esc(dayLabel(x)))}${td(n(v.signups), true)}${td(n(v.logins), true)}${td(n(v.apiTokens), true)}${td(`${n(v.summariesFree)}+${n(v.summariesPaid)}`, true)}${td(n(v.listens), true)}${td(n(v.pastes), true)}${td(usd(v.spentUsd), true)}${td(usd(v.topupsPaid), true)}${t ? td(n(t.days[x].visitors), true) : ''}</tr>`; }).join('\n')}</table>` : '';
+
+  const surfaces = [
+    np ? `npm ${esc(NPM)}: <b>${np.day === null ? 'not posted yet' : n(np.day)}</b> downloads (${n(np.d7)} in 7 days, ${n(np.d30)} in 30)` : null,
+    dk ? `Desktop downloads: <b>${dk.day === null ? 'first count tonight' : signed(dk.day)}</b> (all-time ${n(dk.all)}: ${Object.entries(dk.kinds).map(([k, v]) => `${k} ${n(v)}`).join(', ')})` : null,
+    s ? `Pastes: <b>${n(d.pastes)}</b> (${n(s.totals.pastes7)} in 7 days, ${n(s.totals.pastes30)} in 30) · share links: ${n(s.totals.sharesToday)} new, ${n(s.totals.shares)} total` : null,
+    t ? `readm3.com: <b>${n(t.days[DAY].visitors)}</b> visitors, ${n(t.days[DAY].views)} views (${n(t.v30)} visitors in 30 days)${t.top.length ? `; top pages ${t.top.map(([p, v]) => `${esc(p)} ${n(v)}`).join(', ')}` : ''}` : null,
+  ].filter(Boolean).map((x) => `<li style="margin:4px 0">${x}</li>`).join('');
+
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#fff;color:${INK};font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:760px;margin:0 auto;padding:20px 16px">
+<div style="font-size:12px;color:${MUTE}">readm3 nightly · ${esc(dayLabel(DAY, true))}</div>
+<h1 style="font-size:20px;margin:4px 0 10px">Usage and limits</h1>
+<p style="margin:0 0 14px">${esc(verdict(r))}</p>
+${s ? `<table style="width:100%;border-collapse:separate;border-spacing:6px 0"><tr>
+${tile('Stored (all accounts)', s.totals.stored, null, `${plural(s.totals.blobs, 'stored file')}, largest ${bytes(s.totals.largest)}`, bytes)}
+${tile('Drawn from balances', d.spentUsd, dp.spentUsd, `storage ${usd(d.storageUsd)} · ${plural(d.summariesPaid, 'paid summary', 'paid summaries')} · ${plural(d.listens, 'listen')}`, usd)}
+${tile('Balances held', s.totals.balance, null, `${usd(d.topupsPaid)} added today · ${usd(s.totals.topupsAll)} all-time${s.totals.pendingTopups ? ` · ${n(s.totals.pendingTopups)} pending` : ''}`, usd)}
+${tile('Signups', d.signups, dp.signups, `${plural(s.totals.accounts, 'account')}, ${n(s.totals.outside)} outside`)}
+</tr></table>` : ''}
+${s && (s.totals.overFree || s.totals.near) ? `<div style="font-size:14px;font-weight:700;margin-top:12px;padding:10px 12px;border-left:3px solid ${AMBER};background:#fef0c7;color:${AMBER}">${s.totals.overFree ? `${plural(s.totals.overFree, 'account')} over the free 5 GB (${usd(s.totals.monthly)}/mo). ` : ''}${s.totals.near ? `${plural(s.totals.near, 'account')} past 80% of it.` : ''}</div>` : ''}
+${s ? h('Accounts') + accounts : ''}
+${s ? h('Last 7 days') + strip : ''}
+${h('Surfaces')}<ul style="margin:0;padding-left:18px">${surfaces}</ul>
+<p style="font-size:11px;color:${MUTE};margin-top:22px">Generated ${esc(meta.generatedAt)} on ${esc(hostname())}.${meta.problems.length ? ` Sources skipped: ${esc(meta.problems.join('; '))}.` : ''}</p>
+</div></body></html>`;
+}
+
+function renderText(r, meta) {
+  const s = r.readm3, t = r.traffic, np = r.npm, dk = r.desktop, d = s?.days[DAY];
+  return [
+    `readm3 nightly · ${dayLabel(DAY, true)}`,
+    '',
+    verdict(r),
+    '',
+    ...(s ? s.accounts.map((a) => `${who(a)}: ${a.plan} · stored ${bytes(a.stored)} of ${bytes(FREE_BYTES)} free (${pctOf(a.share)}) · ${n(a.blobs)} stored files, largest ${a.largest ? bytes(a.largest) : '·'} · over-free ${usd(a.monthly)}/mo · balance ${usd(a.balance)}`) : []),
+    s ? `\nDrawn: ${usd(d.spentUsd)} (storage ${usd(d.storageUsd)}, ${n(d.summariesPaid)} paid summaries, ${n(d.listens)} listens) · added ${usd(d.topupsPaid)} · balances ${usd(s.totals.balance)}` : '',
+    s ? `Signups ${n(d.signups)} · web sign-ins ${n(d.logins)} · CLI/MCP tokens ${n(d.apiTokens)} · free summaries ${n(d.summariesFree)} · pastes ${n(d.pastes)}` : '',
+    np ? `npm ${NPM}: ${np.day === null ? 'not posted yet' : n(np.day)} (${n(np.d7)} 7d, ${n(np.d30)} 30d)` : '',
+    dk ? `Desktop downloads: ${dk.day === null ? 'first count' : signed(dk.day)} (all-time ${n(dk.all)})` : '',
+    t ? `readm3.com: ${n(t.days[DAY].visitors)} visitors, ${n(t.days[DAY].views)} views` : '',
+    meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+function subjectLine(r) {
+  const s = r.readm3, d = s?.days[DAY];
+  const parts = [
+    s ? `${bytes(s.totals.stored)} stored` : 'usage unknown',
+    s ? (s.totals.overFree ? `${n(s.totals.overFree)} over free` : null) : null,
+    d ? `${usd(d.spentUsd)} drawn` : null,
+    s ? `${usd(s.totals.balance)} in balances` : null,
+    d ? plural(d.signups, 'signup') : null,
+    r.npm && r.npm.day !== null ? `${n(r.npm.day)} npm` : null,
+  ].filter(Boolean);
+  return `readm3 ${dayLabel(DAY)}: ${parts.join(', ')}`;
+}
+
+// ---------------------------------------------------------------- main
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+async function main() {
+  const t0 = Date.now();
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name} (${e.message.slice(0, 160)})`); return null; } };
+  const [rd, np, dk, tr] = await Promise.all([settle('readm3 db', readm3), settle('npm', npm), settle('desktop', desktop), settle('tracker', traffic)]);
+  if (!rd) throw new Error(`the readm3 database did not answer:\n  ${problems.join('\n  ')}`);
+
+  const r = { readm3: rd, npm: np, desktop: dk, traffic: tr };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', problems };
+  const html = renderHtml(r, meta), text = renderText(r, meta), subject = subjectLine(r);
+  const snap = { day: DAY, ...rd.totals, ...rd.days[DAY], npm: np?.day, desktopAll: dk?.all, visitors: tr?.days[DAY].visitors };
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(join(DATA_DIR, 'out'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'out', 'latest.html'), html);
+  writeFileSync(join(DATA_DIR, 'out', 'latest.txt'), text);
+  writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify(snap));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(DATA_DIR, 'out', 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(key, { from: FROM, to: TO, subject, html, text });
+  console.log(`sent ${id} to ${TO.join(', ')}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`readm3-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = resendKey();
+      if (key) await resend(key, { from: FROM, to: TO, subject: 'readm3 nightly FAILED', text: `The readm3 report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`readm3-nightly: could not mail the failure either: ${e2.message}`); }
+    try { execFileSync('alert', ['--key', 'readm3-nightly', '--every', '12h', `readm3 nightly failed for ${DAY}: ${String(e?.message || e).slice(0, 120)}`], { stdio: 'ignore', timeout: 60_000 }); } catch {}
+  }
+  process.exit(1);
+});
