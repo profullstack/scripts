@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# coinpay-vault-watch --check: read-only capability and signing-format report.
+# Remind Anthony before CoinPay's operator vault locks, and tell him at once when it is locked
+# (only applicable when the deployed runtime supports the vault).
+# Capability and pending signing formats come from a read-only runtime probe.
+# For vault-capable runtimes, status comes from the CURRENT container log:
+#   "[operator-keys] unlocked until <ISO>"  /  "operator keys locked".
+# Cron: */15 * * * *  coinpay-vault-watch      (stamps in ~/.local/state/coinpay-vault-watch)
+set -uo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+C=coinpayportalcom-app-1; S="$HOME/.local/state/coinpay-vault-watch"; mkdir -p "$S"
+URL="https://coinpayportal.com/admin/operator-vault"
+TO=$(grep -h '^ALERT_EMAIL=' "$HOME/.config/alert/env" 2>/dev/null | cut -d= -f2- | tr -d '"')
+log(){ printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$S/watch.log"; }
+notify(){ # <subject> <body> — one critical alert; smshub chooses the delivery channel.
+  if [ -n "$TO" ]; then
+    env -u RESEND_API_KEY mail send --to "$TO" --subject "$1" --via resend --body "$2" >/dev/null 2>&1 || log "email failed: $1"
+  fi
+  alert --severity critical --key coinpay-vault-call --every 6h "$1" >/dev/null 2>&1 || log "critical alert failed"
+  log "notified: $1"
+}
+notify_issue(){
+  local now last
+  now=$(date -u +%s); last=$(cat "$S/locked" 2>/dev/null || echo 0)
+  if [ $((now - last)) -ge 21600 ]; then
+    echo "$now" > "$S/locked"
+    notify "$1" "$2"
+  fi
+}
+# Ask the CURRENT runtime and database, rather than interpreting missing logs as a lock.
+tool_root=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+probe_file="${COINPAY_WATCH_PROBE:-$tool_root/lib/coinpay-vault-watch/probe.mjs}"
+probe=$(docker exec -i -w /app "$C" node --input-type=module < "$probe_file" 2>/dev/null) || probe='{"mode":"probe-error"}'
+if [ "${1:-}" = --check ]; then printf '%s\n' "$probe"; exit 0; fi
+mode=$(printf '%s' "$probe" | python3 -c 'import json,sys;print(json.load(sys.stdin)["mode"])' 2>/dev/null || echo probe-error)
+sealed=$(printf '%s' "$probe" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("sealedSigningRows",0))' 2>/dev/null || echo 0)
+case "$mode" in
+  legacy)
+    if [ "$sealed" -gt 0 ]; then
+      notify_issue "CoinPay signing mismatch: deployed app cannot read $sealed vault-sealed payment keys" "The deployed CoinPay version has no operator-vault workflow, but $sealed payment signing records require that format. Restore a compatible signing version or complete a reviewed key migration. The old /admin/operator-vault link is unavailable on this deployment. No keys or payments were changed by this monitor."
+    else
+      log "legacy signing: no vault-sealed payment keys requiring forwarding; vault unlock alert not applicable"
+    fi
+    exit 0 ;;
+  operator-vault) ;;
+  *)
+    notify_issue "CoinPay signing readiness could not be verified" "The current runtime capability probe returned $mode. This does not establish that the vault is locked or that payments have failed. Check the deployment and monitor."
+    exit 1 ;;
+esac
+line=$(docker logs "$C" 2>&1 | grep -E '\[operator-keys\] unlocked until|operator keys locked' | tail -1)
+now=$(date -u +%s)
+if [[ "$line" =~ unlocked\ until\ ([0-9TZ:.-]+) ]] && until=$(date -u -d "${BASH_REMATCH[1]}" +%s 2>/dev/null) && [ "$until" -gt "$now" ]; then
+  rm -f "$S/locked"
+  left=$(( (until - now) / 3600 )); when=$(date -u -d "@$until" '+%a %b %-d %H:%M UTC')
+  for h in 48 24 6 1; do
+    stamp="$S/remind-$until-$h"
+    if [ $((until - now)) -le $((h * 3600)) ] && [ ! -e "$stamp" ]; then
+      touch "$stamp"
+      notify "CoinPay vault locks in ${left}h (${when})" "CoinPay's operator vault locks at ${when}. When it locks, customer payments stop being forwarded to merchants.
+
+Unlock it before then: ${URL}  (click the eye, type your password, Unlock, 7 days).
+
+-- riotcoder (coinpay-vault-watch on dev2)"
+      break
+    fi
+  done
+  exit 0
+fi
+# A container under 10 minutes old is still mid-deploy: deploy-app.sh hands the old
+# process's unlock to it once healthy (operator-vault-handoff.sh). Judge it next tick.
+started=$(date -u -d "$(docker inspect -f '{{.State.StartedAt}}' "$C" 2>/dev/null)" +%s 2>/dev/null || echo 0)
+[ $((now - started)) -lt 600 ] && exit 0
+if [[ ! "$line" =~ operator\ keys\ locked ]] && [[ ! "$line" =~ unlocked\ until ]]; then
+  notify_issue "CoinPay vault state is unknown; signing readiness needs verification" "This deployed version supports the operator vault, but its log has no explicit locked or unlocked status. No claim that payments are blocked can be made from missing logs. Check ${URL}."
+  exit 0
+fi
+# Locked (expired, redeployed or restarted). Repeat every 6h until unlocked.
+last=$(cat "$S/locked" 2>/dev/null || echo 0)
+if [ $((now - last)) -ge 21600 ]; then
+  echo "$now" > "$S/locked"
+  notify "CoinPay vault is LOCKED: payments are not forwarding" "CoinPay's operator vault is locked (it expired, or CoinPay was redeployed/restarted). Customer payments are NOT being forwarded to merchants until you unlock it.
+
+Unlock now: ${URL}  (click the eye, type your password, Unlock, 7 days).
+
+This repeats every 6 hours until it is unlocked.
+-- riotcoder (coinpay-vault-watch on dev2)"
+fi

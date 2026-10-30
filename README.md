@@ -500,3 +500,18 @@ threatcrush-nightly --to a@b.com,c@d    someone else (default anthony@ + preshy@
 
 Runs from cron at 06:00 UTC. A failure is mailed as "ThreatCrush nightly FAILED"
 and raised with `alert --key threatcrush-nightly`.
+
+### CoinPay signing monitor
+
+`coinpay-vault-watch` runs on dev2 every 15 minutes. `coinpay-vault-watch --check`
+reports current runtime capability and counts incompatible signing records without
+sending notifications, unlocking keys, decrypting keys, or forwarding payments.
+It requires Docker access and the deployed app's existing Supabase configuration.
+
+Legacy deployments with operator-sealed signing records produce a deployment/format
+mismatch alert, with no instruction to visit a nonexistent unlock page. Legacy
+deployments without such records have no vault-unlock requirement. Vault-capable
+deployments use explicit status logs; missing status is unknown, never proof of a lock.
+Signing-format counts are compatibility checks, not evidence of current on-chain balances.
+One critical smshub alert per six-hour incident cycle replaces duplicate text/call
+requests; smshub selects its supported delivery channel. Existing unrelated alerts remain.
