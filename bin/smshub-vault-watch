@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Report SMSHub vault state and warn before its in-memory unlock expires.
+# Run every 15 minutes beside coinpay-vault-watch.
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+BASE="${SMSHUB_URL:-https://smshub.dev}"
+STATE="$HOME/.local/state/smshub-vault-watch"
+ALERT="$HOME/.local/bin/alert"
+mkdir -p -m 700 "$STATE"
+umask 077
+
+check_only=0
+if [[ "${1:-}" == "--check" ]]; then check_only=1; fi
+
+# Refresh the cached API key from the team vault when possible. --check makes a
+# read-only request and emails if the API key itself has been rejected.
+if ! "$ALERT" --check >/dev/null 2>&1; then
+  echo "SMSHub alert API key check failed" >&2
+  exit 1
+fi
+
+key_file="$HOME/.local/state/alert/smshub-key"
+if [[ ! -s "$key_file" ]]; then
+  echo "SMSHub alert key cache is missing" >&2
+  exit 1
+fi
+api_key=$(<"$key_file")
+response=$(mktemp "$STATE/status.XXXXXX")
+trap 'rm -f "$response"' EXIT
+
+code=$(curl -sS --max-time 20 -o "$response" -w '%{http_code}' \
+  "$BASE/api/vault" -H "X-API-Key: $api_key" -H 'Accept: application/json') || code=000
+state=$(jq -r '.state // "unknown"' "$response" 2>/dev/null || echo unknown)
+expires=$(jq -r '.expires_at // empty' "$response" 2>/dev/null || true)
+
+if [[ "$code" != 200 || "$state" != unlocked ]]; then
+  summary="SMSHub vault status is $state (HTTP $code). Alert delivery and provider sends may fail; unlock at $BASE/settings."
+  if (( check_only )); then
+    printf '%s\n' "$summary"
+    exit 1
+  fi
+  "$ALERT" --severity critical --key smshub-vault-locked --every 6h "$summary" || true
+  exit 0
+fi
+
+now=$(date -u +%s)
+until=$(date -u -d "$expires" +%s 2>/dev/null || echo 0)
+if (( until == 0 )); then
+  summary="SMSHub vault is unlocked, but expires_at could not be read. Check $BASE/settings."
+  if (( check_only )); then printf '%s\n' "$summary"; exit 1; fi
+  "$ALERT" --severity critical --key smshub-vault-expiry-unknown --every 6h "$summary" || true
+  exit 0
+fi
+
+remaining=$((until - now))
+if (( remaining <= 0 )); then
+  summary="SMSHub vault has expired. Unlock at $BASE/settings; provider sends may fail."
+  if (( check_only )); then printf '%s\n' "$summary"; exit 1; fi
+  "$ALERT" --severity critical --key smshub-vault-expired --every 6h "$summary" || true
+  exit 0
+fi
+
+printf 'SMSHub vault unlocked until %s (%dh remaining)\n' "$expires" "$((remaining / 3600))"
+if (( check_only )); then exit 0; fi
+
+# One reminder at the nearest due threshold, so a missed cron window cannot
+# generate a burst of stale reminders.
+for hours in 1 6 24 48; do
+  if (( remaining <= hours * 3600 )); then
+    reminder_key="smshub-vault-${until}-${hours}h"
+    "$ALERT" --severity critical --key "$reminder_key" --every 7d \
+      -- "SMSHub vault expires in ${hours}h (at ${expires}). Unlock it at ${BASE}/settings. ThreatCrush fallback calls and provider sends depend on it." || true
+    break
+  fi
+done
