@@ -122,13 +122,13 @@ function deliveries({ record }) {
     const before = last.get(n.id);
     const since = before ? Math.max(0, s.sent - before.sent) : null;
     const quietFor = s.lastSentAt ? Date.parse(now) - Date.parse(s.lastSentAt) : Infinity;
-    const state = s.remaining === 0 ? 'done'
-      : s.running ? 'sending'
+    const state = s.running ? 'sending'
+      : s.remaining === 0 ? (Number(s.pending) > 0 ? 'uncertain' : 'done')
       : n.status === 'scheduled' ? 'scheduled'
       : quietFor > DAY_MS ? 'stalled' : 'waiting';
     rows.push({
       id: n.id, list: n.list, subject: n.subject, status: n.status, state,
-      audience: s.audience, sent: s.sent, failed: s.failed, remaining: s.remaining,
+      audience: s.audience, sent: s.sent, failed: s.failed, pending: Number(s.pending) || 0, remaining: s.remaining,
       since, lastSentAt: s.lastSentAt, scheduledFor: n.scheduledFor || null,
       etaMs: s.running ? s.etaMs : null,
     });
@@ -153,10 +153,13 @@ function renderDeliveries(d) {
       : r.state === 'stalled' ? `, nothing since ${r.lastSentAt ? r.lastSentAt.slice(0, 16).replace('T', ' ') : 'the start'}: run myna newsletter blast --go ${r.id}`
       : '';
     lines.push(`  ${r.id}  [${r.state}]  ${r.list}`);
-    lines.push(`    ${num(r.sent)} of ${num(r.audience)} sent${r.failed ? `, ${num(r.failed)} failed` : ''}` +
-      `${r.since != null ? ` (${plus(r.since)} since last)` : ''}${when}`);
+    const over = Math.max(0, r.sent - r.audience);
+    lines.push(`    ${num(r.sent)} of ${num(r.audience)} sent${over ? ` (${num(over)} above listed audience)` : ''}` +
+      `${r.failed ? `, ${num(r.failed)} failed` : ''}${r.pending ? `, ${num(r.pending)} uncertain pending` : ''}` +
+      `${r.remaining ? `, ${num(r.remaining)} still to go` : ''}${r.since != null ? ` (${plus(r.since)} since last)` : ''}${when}`);
   }
   if (!d.rows.length) lines.push('  Nothing sent or sending in the last week.');
+  if (d.rows.some((r) => r.pending)) lines.push('  Pending outcomes are uncertain; retrying them can send duplicates.');
   return lines.join('\n');
 }
 
@@ -465,6 +468,7 @@ const chip = (text, fg, bg) => `<span style="display:inline-block;padding:2px 8p
 
 const STATE_CHIP = {
   sent: ['#1a7f37', '#e6f4ea'], sending: [BLUE, '#eef3fb'], stalled: [DOWN, '#fdecea'],
+  done: ['#1a7f37', '#e6f4ea'], uncertain: ['#8a5a00', '#fdf3dc'], scheduled: ['#8a5a00', '#fdf3dc'], waiting: [MUTE, '#f4f4f2'],
   overdue: [DOWN, '#fdecea'], due: ['#8a5a00', '#fdf3dc'], upcoming: [MUTE, '#f4f4f2'], unknown: [MUTE, '#f4f4f2'],
 };
 
@@ -595,6 +599,93 @@ ${schedHtml}
 </td></tr></table></div>`;
 }
 
+function deliveryMetric(label, value, sub) {
+  return `<td width="25%" style="padding:9px 11px;border:1px solid ${LINE};border-radius:8px;vertical-align:top;background:#fff">` +
+    `<div style="font-size:10px;color:${MUTE};text-transform:uppercase;letter-spacing:.05em">${esc(label)}</div>` +
+    `<div style="font-size:23px;font-weight:700;line-height:1.25;color:${INK}">${esc(value)}</div>` +
+    `<div style="font-size:11px;color:${MUTE};margin-top:2px">${esc(sub)}</div></td>`;
+}
+
+function deliveryWhen(r, d) {
+  if (r.state === 'sending' && r.etaMs) {
+    return `Estimated finish ${new Date(Date.parse(d.now) + r.etaMs).toISOString().slice(11, 16)} UTC`;
+  }
+  if (r.state === 'scheduled' && r.scheduledFor) {
+    return `Scheduled for ${r.scheduledFor.slice(0, 16).replace('T', ' ')} UTC`;
+  }
+  if (r.state === 'stalled') {
+    const last = r.lastSentAt ? `${r.lastSentAt.slice(0, 16).replace('T', ' ')} UTC` : 'the start';
+    return `No sends since ${last}. To resume: myna newsletter blast --go ${r.id}`;
+  }
+  return '';
+}
+
+function renderDeliveriesSectionHtml(d, { trackingOff = false } = {}) {
+  const stalled = d.rows.filter((r) => r.state === 'stalled').length;
+  const pending = d.rows.reduce((total, r) => total + r.pending, 0);
+  const remainingSub = d.cap && d.days ? `about ${d.days} day${d.days === 1 ? '' : 's'} at the daily cap` : 'across active lists';
+  const cards = `<table role="presentation" width="100%" cellpadding="0" cellspacing="6" style="margin:10px -6px 6px;border-collapse:separate"><tr>` +
+    deliveryMetric('Sent since report', num(d.sentSince), 'since the previous report') +
+    deliveryMetric('Still to go', num(d.remaining), remainingSub) +
+    deliveryMetric('Stalled', num(stalled), 'no sends in more than 24 hours') +
+    deliveryMetric('Uncertain', num(pending), 'outcomes that may need review') +
+    `</tr></table>`;
+
+  const rows = d.rows.map((r) => {
+    const [fg, bg] = STATE_CHIP[r.state] || STATE_CHIP.unknown;
+    const over = Math.max(0, r.sent - r.audience);
+    const progress = r.audience ? Math.min(100, Math.max(0, (r.sent / r.audience) * 100)) : 0;
+    const progressColor = r.state === 'stalled' ? DOWN : r.state === 'done' ? UP : BLUE;
+    const when = deliveryWhen(r, d);
+    const detail = [
+      `${num(r.sent)} of ${num(r.audience)} sent`,
+      `${num(r.remaining)} still to go`,
+      r.failed ? `${num(r.failed)} failed` : '',
+      r.pending ? `${num(r.pending)} uncertain pending` : '',
+      r.since != null ? `${plus(r.since)} since last report` : '',
+    ].filter(Boolean).join(' · ');
+    return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:9px;background:#fff;border:1px solid ${LINE};border-radius:8px"><tr><td style="padding:11px 12px">` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="vertical-align:top;word-break:break-word">` +
+      `<div style="font-size:14px;font-weight:700;color:${INK}">${esc(r.id)}</div><div style="font-size:12px;color:${MUTE};margin-top:2px">${esc(r.list || 'Unknown list')}</div></td>` +
+      `<td style="vertical-align:top;text-align:right;padding-left:8px;white-space:nowrap">${chip(r.state, fg, bg)}</td></tr></table>` +
+      `<div style="font-size:12px;color:${INK};margin-top:9px">${detail}</div>` +
+      `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:7px;background:#f0efeb;border-radius:4px"><tr><td style="height:6px;padding:0;line-height:0;font-size:0">` +
+      `<table role="presentation" width="${Math.round(progress)}%" cellpadding="0" cellspacing="0"><tr><td style="height:6px;padding:0;line-height:0;font-size:0;background:${progressColor};border-radius:4px">&nbsp;</td></tr></table>` +
+      `</td></tr></table>` +
+      (over ? `<div style="font-size:11px;color:#8a5a00;margin-top:6px">Sent count is ${num(over)} above the current listed audience.</div>` : '') +
+      (r.state === 'uncertain' ? `<div style="font-size:12px;color:#8a5a00;margin-top:7px">No recipients remain in the send queue, but ${num(r.pending)} outcomes are uncertain.</div>` : '') +
+      (when ? `<div style="font-size:12px;color:${r.state === 'stalled' ? DOWN : MUTE};margin-top:7px;word-break:break-word">${esc(when)}</div>` : '') +
+      `</td></tr></table>`;
+  }).join('');
+
+  const trackingNote = trackingOff
+    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px;background:#eef3fb;border-radius:8px"><tr><td style="padding:9px 11px;font-size:12px;color:${INK}">Tracking is off, so opens and clicks are unavailable. Delivery progress is still reported.</td></tr></table>`
+    : '';
+  const pendingNote = d.rows.some((r) => r.pending)
+    ? `<div style="font-size:11px;color:${MUTE};margin-top:10px">Pending outcomes are uncertain. Retrying them can send duplicate messages.</div>`
+    : '';
+  const empty = d.rows.length ? '' : `<div style="padding:14px 0;font-size:13px;color:${MUTE}">Nothing sent or sending in the last week.</div>`;
+  return `<div style="margin-top:18px;padding-top:14px;border-top:1px solid ${LINE}">` +
+    `<div style="font-size:16px;font-weight:700;color:${INK}">Delivery progress</div>` +
+    `<div style="font-size:12px;color:${MUTE};margin-top:2px">Recent issues · daily cap ${d.cap ? num(d.cap) : 'unknown'} · read at ${esc(d.now.slice(11, 16))} UTC</div>` +
+    trackingNote + cards + rows + empty + pendingNote + '</div>';
+}
+
+function renderDeliveriesHtml(d, { trackingOff = false } = {}) {
+  const date = new Date(d.now).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+  return `<div style="background:#f4f4f2;padding:16px 8px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:${INK}">` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;margin:0 auto;background:#fcfcfb;border-radius:10px"><tr><td style="padding:20px 22px">` +
+    `<div style="font-size:20px;font-weight:700">Newsletter deliveries · ${esc(date)}</div>` +
+    `<div style="font-size:13px;color:${MUTE};margin-top:2px">${d.rows.length} issue${d.rows.length === 1 ? '' : 's'} shown · updated ${esc(d.now.slice(11, 16))} UTC</div>` +
+    renderDeliveriesSectionHtml(d, { trackingOff }) +
+    `<div style="font-size:11px;color:${MUTE};margin-top:20px;border-top:1px solid ${LINE};padding-top:8px">Generated by newsletter-abtest on ${esc(hostname())}.</div>` +
+    `</td></tr></table></div>`;
+}
+
+function htmlDocument(title, body) {
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><body style="margin:0">${body}</body>`;
+}
+
 // ---------------------------------------------------------------- mail
 
 function parseEnv(text) {
@@ -643,13 +734,16 @@ async function main() {
   // Tracking off (on purpose since 2026-10-21) used to mean no mail at all,
   // which hid every send for days. Deliveries still get reported.
   if (!OFFLINE && !trackingOn()) {
-    let text;
+    let text, html;
     try {
       const d = deliveries({ record: !has('--dry-run') });
-      text = `${renderDeliveries(d)}\n\nNo opens or clicks: myna newsletter tracking is off. Turn it back on with: myna newsletter track set <trackingId>`;
+      text = `${renderDeliveries(d)}\n\nTracking is off, so opens and clicks are unavailable. Delivery progress is still reported.`;
+      html = renderDeliveriesHtml(d, { trackingOff: true });
       const stalled = d.rows.filter((r) => r.state === 'stalled').length;
       const subject = `Newsletter: ${num(d.sentSince)} sent, ${num(d.remaining)} to go${stalled ? `, ${stalled} stalled` : ''}`;
-      if (send) await mail(subject, text);
+      const htmlOut = val('--html', null);
+      if (htmlOut) writeFileSync(htmlOut, htmlDocument(subject, html));
+      if (send) await mail(subject, text, html);
     } catch (e) {
       const report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
       if (send) await mail('Newsletter: the delivery report failed', report);
@@ -665,9 +759,9 @@ async function main() {
     text = renderText(m);
     html = renderHtml(m);
     if (!OFFLINE) {
-      const d = renderDeliveries(deliveries({ record: !has('--dry-run') }));
-      text += `\n\n${d}`;
-      html += `<div style="max-width:640px;margin:0 auto;padding:0 16px">${preHtml(d)}</div>`;
+      const d = deliveries({ record: !has('--dry-run') });
+      text += `\n\n${renderDeliveries(d)}`;
+      html += renderDeliveriesSectionHtml(d);
     }
   } catch (e) {
     const report = `newsletter-abtest failed on ${hostname()}:\n\n${e?.stack || e}`;
@@ -676,7 +770,7 @@ async function main() {
     process.exit(1);
   }
   const htmlOut = val('--html', null);
-  if (htmlOut) writeFileSync(htmlOut, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(headline(m))}</title><body style="margin:0">${html}</body>`);
+  if (htmlOut) writeFileSync(htmlOut, htmlDocument(headline(m), html));
   if (send) await mail(headline(m), text, html);
   console.log(text);
 }

@@ -339,6 +339,9 @@ the one file that runs before anything else is installed.
 One email a day while a newsletter A/B test is running: every issue's sent,
 opens, clicks and unsubscribes, what moved since the last reading, and the
 arms pooled across the whole campaign with a two-proportion z test on clicks.
+The delivery section uses the same house-style HTML when tracking is off and
+reports stalled sends, uncertain pending outcomes, and any sent count above the
+current listed audience. Every email also includes the plain-text report.
 
 Opens and clicks keep arriving for days after a send, so a single reading at
 the end cannot tell a real winner from an early lead. The verdict line says
