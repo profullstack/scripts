@@ -1,0 +1,347 @@
+#!/usr/bin/env node
+// pit-nightly — one email a night: pit.world stats for yesterday (UTC). Money (the $1 summary
+// pass by CoinPay invoice and by x402, featured listings), result summaries (read from the page
+// or the snippet, which c0mpute models wrote them), accounts, the directory, the newsletter,
+// votes and traffic, with the last 7 days beside them.
+//
+//   pit-nightly                    send the report for yesterday (UTC)
+//   pit-nightly --dry-run          build it, write it under the data dir, send nothing
+//   pit-nightly --day 2026-11-01   report a specific UTC day
+//   pit-nightly --to a@b.com,c@d   someone else (default anthony@ + preshy@profullstack.com)
+//
+// Sources, each of which may fail on its own and is then named in the email:
+//   pit      https://pit.world/api/admin/stats.json?day= (PIT_ADMIN_TOKEN). pit.world runs as root
+//            on dev2 with its SQLite under /root, so the numbers come over HTTP. Counts only: the
+//            endpoint returns no address, URL, search or domain, and pit.world keeps no searches.
+//   traffic  the CrawlProof tracker rollups of pit.world (CRAWLPROOF_DB_URL).
+// Secrets: PIT_ADMIN_TOKEN from the team vault pit-world--prod; RESEND_API_KEY and
+// CRAWLPROOF_DB_URL from fleet-nightly--prod.
+
+import { execFile, execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PATH = [
+  join(homedir(), '.local/bin'),
+  join(homedir(), '.local/share/mise/shims'),
+  join(homedir(), '.bun/bin'),
+  '/usr/local/bin', '/usr/bin', '/bin',
+  process.env.PATH || '',
+].join(':');
+
+const DATA_DIR = process.env.PIT_NIGHTLY_DATA || join(homedir(), '.local/share/pit-nightly');
+const SITE = process.env.PIT_SITE || 'https://pit.world';
+const DEFAULT_FROM = 'pit.world nightly <pulse@profullstack.com>';
+const DEFAULT_TO = 'anthony@profullstack.com,preshy@profullstack.com';
+const STRIP_DAYS = 7;
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(name);
+const opt = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
+const DRY = flag('--dry-run');
+const TO = (opt('--to') || process.env.PIT_REPORT_TO || DEFAULT_TO).split(',').map((s) => s.trim()).filter(Boolean);
+const FROM = process.env.PIT_REPORT_FROM || DEFAULT_FROM;
+
+const isoDay = (d) => d.toISOString().slice(0, 10);
+const addDays = (iso, k) => isoDay(new Date(Date.parse(`${iso}T00:00:00Z`) + k * 86_400_000));
+const dayLabel = (iso, withYear = false) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  const part = (o) => d.toLocaleDateString('en-US', { timeZone: 'UTC', ...o });
+  return `${part({ weekday: 'short' })} ${part({ month: 'short' })} ${part({ day: 'numeric' })}${withYear ? `, ${part({ year: 'numeric' })}` : ''}`;
+};
+const DAY = opt('--day') || addDays(isoDay(new Date()), -1);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DAY)) throw new Error(`--day wants YYYY-MM-DD, got ${DAY}`);
+const PREV = addDays(DAY, -1);
+const DAYS = Array.from({ length: STRIP_DAYS }, (_, i) => addDays(DAY, i - STRIP_DAYS + 1));
+const FROM30 = addDays(DAY, -29);
+
+const run = (cmd, argv, opts = {}) => new Promise((resolve, reject) => {
+  execFile(cmd, argv, { maxBuffer: 64 << 20, timeout: opts.timeout || 120_000, env: { ...process.env, ...opts.env } }, (err, out, errOut) =>
+    err ? reject(new Error(`${cmd}: ${(errOut || err.message).trim().split('\n').slice(-3).join(' ')}`)) : resolve(out));
+});
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split('\n')) {
+    const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m) continue;
+    let v = m[2];
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    out[m[1]] = v;
+  }
+  return out;
+}
+
+const vaults = {};
+function vault(name) {
+  if (vaults[name]) return vaults[name];
+  vaults[name] = {};
+  const dir = mkdtempSync(join(tmpdir(), 'pit-nightly-'));
+  try {
+    execFileSync('logicsrc', ['teams', 'pull', 'profullstack', name, 'prod', '--env', join(dir, 'env')], { stdio: 'ignore', timeout: 60_000 });
+    vaults[name] = parseEnv(readFileSync(join(dir, 'env'), 'utf8'));
+  } catch {} finally { rmSync(dir, { recursive: true, force: true }); }
+  return vaults[name];
+}
+const secret = (k, from = 'fleet-nightly') => process.env[k] || vault(from)[k];
+
+function resendKey() {
+  const k = secret('RESEND_API_KEY');
+  if (k) return k;
+  const f = join(homedir(), '.config/logicsrc/shell.env');
+  return existsSync(f) ? parseEnv(readFileSync(f, 'utf8')).RESEND_API_KEY : undefined;
+}
+
+/** Named read-only queries against one Postgres, through Bun's client. */
+async function pg(url, queries) {
+  const script = `
+    import { SQL } from "bun";
+    const sql = new SQL(process.env.DBURL);
+    await sql.unsafe("set session characteristics as transaction read only");
+    const [ro] = await sql.unsafe("show transaction_read_only");
+    if (ro.transaction_read_only !== "on") throw new Error("not read-only");
+    const qs = JSON.parse(process.env.QUERIES), out = {};
+    for (const [k, q] of Object.entries(qs)) out[k] = await sql.unsafe(q.sql, q.params || []);
+    console.log(JSON.stringify(out));
+    await sql.close();`;
+  const out = await run('bun', ['-e', script], { env: { DBURL: url, QUERIES: JSON.stringify(queries) }, timeout: 90_000 });
+  return JSON.parse(out.trim().split('\n').pop());
+}
+
+const sum = (xs, f = (x) => x) => xs.reduce((a, x) => a + (Number(f(x)) || 0), 0);
+
+// ---------------------------------------------------------------- sources
+
+/** pit.world's own counts for each day of the strip (and the day before, for the arrows). */
+async function pit() {
+  const token = secret('PIT_ADMIN_TOKEN', 'pit-world');
+  if (!token) throw new Error('no PIT_ADMIN_TOKEN');
+  const one = async (day) => {
+    const r = await fetch(`${SITE}/api/admin/stats.json?day=${day}`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000) });
+    if (!r.ok) throw new Error(`stats ${day}: HTTP ${r.status}`);
+    return r.json();
+  };
+  const days = {};
+  for (const d of [PREV, ...DAYS]) days[d] = await one(d);
+  return days;
+}
+
+async function traffic() {
+  const url = secret('CRAWLPROOF_DB_URL');
+  if (!url) throw new Error('no CRAWLPROOF_DB_URL');
+  const host = new URL(SITE).hostname.replace(/\./g, '\\.');
+  const proj = await pg(url, { p: { sql: `select id::text id from projects where url ~* $1 and archived_at is null order by tracker_enabled desc nulls last, created_at limit 1`, params: [`^https?://(www\\.)?${host}(/|$)`] } });
+  const id = proj.p[0]?.id;
+  if (!id) throw new Error(`no tracker project for ${host.replace(/\\/g, '')}`);
+  const db = await pg(url, {
+    ev: { sql: `select day::text d, page_path p, sum(count)::int n from tracker_event_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and event = 'pageview' and day between $2 and $3 group by 1, 2`, params: [id, addDays(FROM30, -1), DAY] },
+    vis: { sql: `select day::text d, count(distinct visitor_id)::int v from tracker_visitor_daily_stats
+        where project_id = $1 and coalesce(kind, 'human') = 'human' and day between $2 and $3 group by 1`, params: [id, addDays(FROM30, -1), DAY] },
+  });
+  const per = (d) => {
+    const rows = db.ev.filter((r) => r.d === d);
+    return { visitors: db.vis.find((r) => r.d === d)?.v ?? 0, views: sum(rows, (r) => r.n), searches: sum(rows.filter((r) => /^\/search\b/.test(r.p)), (r) => r.n) };
+  };
+  // Top pages, with search pages folded into one line: their paths carry the words people searched.
+  const top = Object.entries(db.ev.filter((r) => r.d === DAY).reduce((a, r) => {
+    const p = /^\/search\b/.test(r.p) ? '/search' : r.p;
+    a[p] = (a[p] || 0) + r.n;
+    return a;
+  }, {})).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  return { days: Object.fromEntries([PREV, ...DAYS].map((d) => [d, per(d)])), v30: sum(db.vis.filter((r) => r.d >= FROM30), (r) => r.v), top };
+}
+
+// ---------------------------------------------------------------- render
+
+const INK = '#0b0b0b', MUTE = '#5c5b57', LINE = '#e6e5e1', UP = '#1a7f37', DOWN = '#b42318', ACCENT = '#6d28d9', SOFT = '#f5f3ff', AMBER = '#b54708';
+const n = (v) => (v === null || v === undefined ? '·' : Number(v).toLocaleString('en-US'));
+const usd = (v) => (v === null || v === undefined ? '·' : `$${Number(v).toFixed(2)}`);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const signed = (d, f = n) => (d > 0 ? `+${f(d)}` : d < 0 ? `-${f(-d)}` : '±0');
+const plural = (k, word, many = `${word}s`) => `${n(k)} ${k === 1 ? word : many}`;
+const pick = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
+
+function verdict(r) {
+  const s = r.pit?.[DAY];
+  if (!s) return 'pit.world did not answer the stats call tonight, so there are no numbers.';
+  const t = r.traffic?.days[DAY];
+  const passes = (s.pass?.soldByInvoice ?? 0) + (s.pass?.soldByX402 ?? 0);
+  return `${usd(s.revenueUsd)} in on ${dayLabel(DAY)}` +
+    `${passes ? ` (${plural(passes, 'summary pass', 'summary passes')}${s.listings?.featuredSold ? `, ${plural(s.listings.featuredSold, 'featured month')}` : ''})` : s.listings?.featuredSold ? ` (${plural(s.listings.featuredSold, 'featured month')})` : ''}. ` +
+    `${plural(s.summaries?.written ?? 0, 'summary', 'summaries')} written, ${n(s.summaries?.fromPage ?? 0)} from the page itself. ` +
+    `${plural(s.accounts?.new ?? 0, 'new account')}, ${plural(s.newsletter?.new ?? 0, 'newsletter signup')}` +
+    `${t ? `, ${n(t.visitors)} visitors and ${n(t.searches)} search pages viewed` : ''}.`;
+}
+
+function renderHtml(r, meta) {
+  const P = r.pit, T = r.traffic;
+  const s = P?.[DAY], p = P?.[PREV];
+  const tile = (label, cur, prev, sub, fmt = n) => `<td style="width:25%;background:${SOFT};border-radius:10px;padding:12px 14px;vertical-align:top">
+<div style="font-size:12px;color:${MUTE};text-transform:uppercase;letter-spacing:.04em">${label}</div>
+<div style="font-size:26px;font-weight:700;margin-top:2px;color:${INK}">${fmt(cur)}</div>
+<div style="font-size:12px;color:${prev == null || cur == null ? MUTE : cur > prev ? UP : cur < prev ? DOWN : MUTE}">${prev == null || cur == null ? '&nbsp;' : `${signed(cur - prev, fmt === usd ? usd : n)} vs ${esc(dayLabel(PREV))}`}</div>
+<div style="font-size:11px;color:${MUTE};margin-top:4px">${sub}</div></td>`;
+  const h = (txt) => `<h2 style="font-size:14px;margin:24px 0 8px;border-bottom:2px solid ${LINE};padding-bottom:5px;color:${INK}">${txt}</h2>`;
+  const td = (x, right) => `<td style="padding:6px 8px;border-bottom:1px solid ${LINE};${right ? 'text-align:right;' : ''}font-size:13px">${x}</td>`;
+  const th = (x, right) => `<th style="padding:6px 8px;border-bottom:1px solid ${LINE};${right ? 'text-align:right;' : 'text-align:left;'}font-size:12px;color:${MUTE};font-weight:600">${x}</th>`;
+  const row = (label, value, note = '') => `<tr>${td(label)}${td(`<b>${value}</b>`, true)}${td(`<span style="color:${MUTE}">${note}</span>`)}</tr>`;
+  // A bar per day, scaled to the week's biggest: the shape of the week at a glance.
+  const bars = (key, fmt = n, color = ACCENT) => {
+    const vals = DAYS.map((d) => Number(pick(P?.[d], key) ?? 0));
+    const max = Math.max(1, ...vals);
+    return `<table style="border-collapse:collapse"><tr>${vals.map((v, i) => `<td style="vertical-align:bottom;padding:0 2px;text-align:center">
+<div style="font-size:10px;color:${MUTE}">${v ? fmt(v) : ''}</div>
+<div style="width:26px;height:${Math.max(2, Math.round((v / max) * 48))}px;background:${v ? color : LINE};border-radius:3px 3px 0 0"></div>
+<div style="font-size:10px;color:${MUTE};margin-top:2px">${esc(dayLabel(DAYS[i]).split(' ')[0])}</div></td>`).join('')}</tr></table>`;
+  };
+
+  const money = s ? `<table style="width:100%;border-collapse:collapse">
+${row('Summary passes by CoinPay invoice', n(s.pass?.soldByInvoice ?? 0), `$1 each · ${n(s.pass?.invoicesOpened ?? 0)} opened, ${n(s.pass?.invoicesOpen ?? 0)} still unpaid`)}
+${row('Summary passes by x402 (bots and agents)', n(s.pass?.soldByX402 ?? 0), '$1 each, USDC, settled by CoinPay')}
+${row('Featured listings', n(s.listings?.featuredSold ?? 0), `${usd(s.listings?.featuredUsd ?? 0)} · ${n(s.listings?.featuredActive ?? 0)} active`)}
+${row('Total for the day', usd(s.revenueUsd), `summary passes all-time ${usd(s.pass?.allTimeUsd ?? 0)}`)}
+</table>` : '';
+
+  const models = s?.summaries?.models?.length ? s.summaries.models.map((m) => `${esc(m.model)} ×${n(m.n)}`).join(', ') : 'none';
+  const summaries = s ? `<table style="width:100%;border-collapse:collapse">
+${row('Written', n(s.summaries?.written ?? 0), `${n(s.summaries?.fromPage ?? 0)} from the page, ${n(s.summaries?.fromSnippet ?? 0)} from the snippet (page unreadable)${(s.summaries?.written ?? 0) - (s.summaries?.fromPage ?? 0) - (s.summaries?.fromSnippet ?? 0) > 0 ? `, ${n((s.summaries?.written ?? 0) - (s.summaries?.fromPage ?? 0) - (s.summaries?.fromSnippet ?? 0))} before pages were read` : ''}`)}
+${row('On a paid pass', n(s.pass?.summariesOnPasses ?? 0), `${n(s.pass?.activeAccounts ?? 0)} account passes and ${n(s.pass?.activeTokens ?? 0)} x402 tokens active`)}
+${row('Cached in all', n(s.summaries?.total ?? 0), 'a cached summary is free and instant for the next person')}
+${row('c0mpute models', '', esc(models))}
+</table>
+<div style="margin-top:10px">${bars('summaries.written')}</div>` : '';
+
+  const people = s ? `<table style="width:100%;border-collapse:collapse">
+${row('Accounts', n(s.accounts?.total ?? 0), `${n(s.accounts?.new ?? 0)} new · ${n(s.accounts?.signIns ?? 0)} sign-ins · ${n(s.accounts?.apiTokens ?? 0)} CLI/API tokens made`)}
+${row('Newsletter', n(s.newsletter?.total ?? 0), `${n(s.newsletter?.new ?? 0)} confirmed today · ${n(s.newsletter?.pending ?? 0)} waiting to confirm`)}
+${row('Votes', n(s.votes?.cast ?? 0), `${n(s.votes?.up ?? 0)} up, ${n(s.votes?.down ?? 0)} down`)}
+</table>` : '';
+
+  const directory = s ? `<table style="width:100%;border-collapse:collapse">
+${row('Listings', n(s.listings?.total ?? 0), `${n(s.listings?.claimed ?? 0)} claimed by their owners · ${n(s.listings?.claimedToday ?? 0)} claimed today`)}
+${row('Quote requests', n(s.listings?.quoteRequests ?? 0), 'sent to listed businesses')}
+</table>` : '';
+
+  const visits = T ? `<table style="width:100%;border-collapse:collapse">
+${row('Visitors', n(T.days[DAY].visitors), `${n(T.days[DAY].views)} page views · ${n(T.v30)} visitors in 30 days`)}
+${row('Search pages viewed', n(T.days[DAY].searches), 'from the page tracker; pit.world itself keeps no searches')}
+</table>
+${T.top.length ? `<p style="font-size:12px;color:${MUTE};margin:8px 0 0">Top pages: ${T.top.map(([pth, v]) => `${esc(pth)} ${n(v)}`).join(' · ')}</p>` : ''}` : '';
+
+  const strip = P ? `<table style="width:100%;border-collapse:collapse;margin-top:6px"><tr>${th('Day')}${th('Revenue', true)}${th('Passes', true)}${th('Summaries', true)}${th('New accounts', true)}${th('Newsletter', true)}${th('Votes', true)}${T ? th('Visitors', true) + th('Searches', true) : ''}</tr>
+${DAYS.slice().reverse().map((d) => { const v = P[d] || {}; return `<tr>${td(esc(dayLabel(d)))}${td(usd(v.revenueUsd ?? 0), true)}${td(n((v.pass?.soldByInvoice ?? 0) + (v.pass?.soldByX402 ?? 0)), true)}${td(n(v.summaries?.written ?? 0), true)}${td(n(v.accounts?.new ?? 0), true)}${td(n(v.newsletter?.new ?? 0), true)}${td(n(v.votes?.cast ?? 0), true)}${T ? td(n(T.days[d]?.visitors ?? 0), true) + td(n(T.days[d]?.searches ?? 0), true) : ''}</tr>`; }).join('\n')}</table>` : '';
+
+  const passes = s ? (s.pass?.soldByInvoice ?? 0) + (s.pass?.soldByX402 ?? 0) : null;
+  const passesPrev = p ? (p.pass?.soldByInvoice ?? 0) + (p.pass?.soldByX402 ?? 0) : null;
+  const unpaid = s?.pass?.invoicesOpen ?? 0;
+
+  return `<!doctype html><html><body style="margin:0;padding:0;background:#faf9f7;color:${INK};font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:760px;margin:0 auto;padding:22px 16px">
+<div style="background:linear-gradient(135deg,#1e1b4b,${ACCENT});color:#fff;border-radius:14px;padding:18px 20px">
+<div style="font-size:12px;opacity:.8;letter-spacing:.05em;text-transform:uppercase">pit.world nightly · ${esc(dayLabel(DAY, true))}</div>
+<div style="font-size:22px;font-weight:700;margin:4px 0 6px">${esc(s ? `${usd(s.revenueUsd)} in · ${plural(s.summaries?.written ?? 0, 'summary', 'summaries')} · ${plural(s.accounts?.new ?? 0, 'new account')}` : 'No numbers tonight')}</div>
+<div style="font-size:14px;opacity:.92">${esc(verdict(r))}</div>
+</div>
+<div style="background:#fff;border-radius:14px;padding:6px 14px 16px;margin-top:12px;border:1px solid ${LINE}">
+${s ? `<table style="width:100%;border-collapse:separate;border-spacing:6px 10px"><tr>
+${tile('Revenue', s.revenueUsd ?? 0, p?.revenueUsd ?? null, `passes ${usd(s.pass?.revenueUsd ?? 0)} · featured ${usd(s.listings?.featuredUsd ?? 0)}`, usd)}
+${tile('Passes sold', passes, passesPrev, `${n(s.pass?.soldByInvoice ?? 0)} invoice · ${n(s.pass?.soldByX402 ?? 0)} x402`)}
+${tile('Summaries', s.summaries?.written ?? 0, p?.summaries?.written ?? null, `${n(s.summaries?.fromPage ?? 0)} read from the page`)}
+${tile(T ? 'Visitors' : 'New accounts', T ? T.days[DAY].visitors : s.accounts?.new ?? 0, T ? T.days[PREV].visitors : p?.accounts?.new ?? null, T ? `${n(T.days[DAY].searches)} search pages viewed` : `${n(s.accounts?.total ?? 0)} accounts in all`)}
+</tr></table>` : ''}
+${unpaid ? `<div style="font-size:13px;margin:4px 6px 0;padding:9px 12px;border-left:3px solid ${AMBER};background:#fef0c7;color:${AMBER}">${plural(unpaid, 'summary pass invoice')} opened and not paid yet.</div>` : ''}
+${s ? h('Money') + money : ''}
+${s ? h('Summaries') + summaries : ''}
+${s ? h('People') + people : ''}
+${s ? h('Directory') + directory : ''}
+${T ? h('Traffic') + visits : ''}
+${P ? h('Last 7 days') + strip : ''}
+</div>
+<p style="font-size:11px;color:${MUTE};margin:14px 4px 0">Counts only: no searches, addresses or pages are in this report. Generated ${esc(meta.generatedAt)} on ${esc(hostname())}.${meta.problems.length ? ` Sources skipped: ${esc(meta.problems.join('; '))}.` : ''}</p>
+</div></body></html>`;
+}
+
+function renderText(r, meta) {
+  const s = r.pit?.[DAY], t = r.traffic?.days[DAY];
+  return [
+    `pit.world nightly · ${dayLabel(DAY, true)}`,
+    '',
+    verdict(r),
+    '',
+    s ? `Money: ${usd(s.revenueUsd)} · passes ${n(s.pass?.soldByInvoice ?? 0)} by invoice + ${n(s.pass?.soldByX402 ?? 0)} by x402 · featured ${n(s.listings?.featuredSold ?? 0)} (${usd(s.listings?.featuredUsd ?? 0)}) · passes all-time ${usd(s.pass?.allTimeUsd ?? 0)}` : '',
+    s ? `Summaries: ${n(s.summaries?.written ?? 0)} written (${n(s.summaries?.fromPage ?? 0)} page, ${n(s.summaries?.fromSnippet ?? 0)} snippet) · ${n(s.pass?.summariesOnPasses ?? 0)} on passes · ${n(s.summaries?.total ?? 0)} cached` : '',
+    s ? `People: ${n(s.accounts?.total ?? 0)} accounts (${n(s.accounts?.new ?? 0)} new, ${n(s.accounts?.signIns ?? 0)} sign-ins) · newsletter ${n(s.newsletter?.total ?? 0)} (+${n(s.newsletter?.new ?? 0)}, ${n(s.newsletter?.pending ?? 0)} pending) · votes ${n(s.votes?.cast ?? 0)}` : '',
+    s ? `Directory: ${n(s.listings?.total ?? 0)} listings, ${n(s.listings?.claimed ?? 0)} claimed (+${n(s.listings?.claimedToday ?? 0)}) · ${n(s.listings?.quoteRequests ?? 0)} quote requests` : '',
+    t ? `Traffic: ${n(t.visitors)} visitors, ${n(t.views)} views, ${n(t.searches)} search pages` : '',
+    meta.problems.length ? `\nSources skipped: ${meta.problems.join('; ')}` : '',
+  ].filter((l) => l !== '').join('\n');
+}
+
+function subjectLine(r) {
+  const s = r.pit?.[DAY], t = r.traffic?.days[DAY];
+  const passes = s ? (s.pass?.soldByInvoice ?? 0) + (s.pass?.soldByX402 ?? 0) : 0;
+  const parts = [
+    s ? `${usd(s.revenueUsd)} in` : 'stats unavailable',
+    passes ? plural(passes, 'pass', 'passes') : null,
+    s ? plural(s.summaries?.written ?? 0, 'summary', 'summaries') : null,
+    s ? plural(s.accounts?.new ?? 0, 'new account') : null,
+    t ? `${n(t.visitors)} visitors` : null,
+  ].filter(Boolean);
+  return `pit.world ${dayLabel(DAY)}: ${parts.join(', ')}`;
+}
+
+// ---------------------------------------------------------------- main
+
+async function resend(key, body) {
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.id) throw new Error(`Resend ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  return j.id;
+}
+
+async function main() {
+  const t0 = Date.now();
+  const problems = [];
+  const settle = async (name, fn) => { try { return await fn(); } catch (e) { problems.push(`${name} (${e.message.slice(0, 160)})`); return null; } };
+  const [pt, tr] = await Promise.all([settle('pit.world stats', pit), settle('tracker', traffic)]);
+  if (!pt) throw new Error(`pit.world did not answer:\n  ${problems.join('\n  ')}`);
+
+  const r = { pit: pt, traffic: tr };
+  const meta = { generatedAt: new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC', problems };
+  const html = renderHtml(r, meta), text = renderText(r, meta), subject = subjectLine(r);
+
+  mkdirSync(join(DATA_DIR, 'days'), { recursive: true });
+  mkdirSync(join(DATA_DIR, 'out'), { recursive: true });
+  writeFileSync(join(DATA_DIR, 'out', 'latest.html'), html);
+  writeFileSync(join(DATA_DIR, 'out', 'latest.txt'), text);
+  writeFileSync(join(DATA_DIR, 'days', `${DAY}.json`), JSON.stringify({ ...pt[DAY], traffic: tr?.days[DAY] ?? null }));
+
+  if (DRY) {
+    console.log(text);
+    console.log(`\ndry run · subject: ${subject} · wrote ${join(DATA_DIR, 'out', 'latest.html')} · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    return;
+  }
+  const key = resendKey();
+  if (!key) throw new Error('no RESEND_API_KEY to send with');
+  const id = await resend(key, { from: FROM, to: TO, subject, html, text });
+  console.log(`sent ${id} to ${TO.join(', ')}: ${subject} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+main().catch(async (e) => {
+  const msg = String(e && e.stack || e);
+  console.error(`pit-nightly: ${msg}`);
+  if (!DRY) {
+    try {
+      const key = resendKey();
+      if (key) await resend(key, { from: FROM, to: TO, subject: 'pit.world nightly FAILED', text: `The pit.world report for ${DAY} could not be produced.\n\n${msg}\n\nHost: ${hostname()}` });
+    } catch (e2) { console.error(`pit-nightly: could not mail the failure either: ${e2.message}`); }
+    try { execFileSync('alert', ['--key', 'pit-nightly', '--every', '12h', `pit.world nightly failed for ${DAY}: ${String(e?.message || e).slice(0, 120)}`], { stdio: 'ignore', timeout: 60_000 }); } catch {}
+  }
+  process.exit(1);
+});
