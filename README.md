@@ -93,15 +93,12 @@ commits is never moved, only re-symlinked.
 
 ### `gh-prs`
 
-Lists open pull requests across any number of organizations and personal
-accounts, newest first, as an aligned table. In a capable terminal the PR number
-and URL become clickable hyperlinks.
-
-```sh
-gh-prs --orgs profullstack,moshcoder,h4kr,infernetprotocol
-gh-prs --users ralyodio
-gh-prs --orgs profullstack --users ralyodio --limit 50
-```
+Moved to [profullstack/cli-tools](https://github.com/profullstack/cli-tools#gh-prs)
+on 2026-11-13: two implementations of one name on `PATH` drift, and cli-tools has
+carried the TypeScript port, with tests, since 2026-09-04. Same flags. `gh-prs-fix-all` and `tcfeed`
+went with it.
+`curl -fsSL https://raw.githubusercontent.com/profullstack/cli-tools/master/install.sh | sh`
+installs it.
 
 ### `gh-issues`
 
@@ -153,33 +150,11 @@ installs it.
 
 ### `domainjson`
 
-Whois-style, JSON-first name lookup. Prints a single JSON object:
-
-```json
-{ "name": "...", "rdap": { ... }, "dns": { "records": {}, "hosts": [], "reverse": [], "axfr": [] } }
-```
-
-```sh
-domainjson example.com
-domainjson --timeout 8000 test.hacker
-domainjson -s https://rdap.nic.cz -t domain example.cz   # openrdap args pass through
-```
-
-Names ending in a [Moshpit](https://pit.moshcode.sh) TLD skip RDAP and are
-served from the registry API under a `moshpit` key instead. Everything else
-goes through the OpenRDAP CLI (`rdap`); its flags pass through unchanged,
-except the output-format flags (`--text`, `--whois`, `--raw`), which are
-dropped — the RDAP section is always JSON. DNS is queried one type at a time
-(`A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`; never `ANY`), plus reverse PTR for
-every resolved address and an AXFR attempt against each nameserver — a
-refused transfer is reported, never fatal. If every data source fails, the
-exit status is non-zero and the JSON carries an `error` key.
-
-| Flag | Effect |
-| --- | --- |
-| `--registry URL` | Moshpit registry base URL, default `https://pit.moshcode.sh` |
-| `--timeout MS` | per-query timeout for HTTP and dig, default 4000 |
-| `--name NAME` | alternative to the positional name argument |
+Moved to [profullstack/cli-tools](https://github.com/profullstack/cli-tools#domainjson)
+on 2026-11-13: two implementations of one name on `PATH` drift, and cli-tools has
+carried the TypeScript port, with tests, since 2026-09-04. Same flags.
+`curl -fsSL https://raw.githubusercontent.com/profullstack/cli-tools/master/install.sh | sh`
+installs it.
 
 ### `provision-ssh-keys`
 
