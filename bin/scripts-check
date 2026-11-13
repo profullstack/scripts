@@ -87,8 +87,8 @@ if command -v shellcheck >/dev/null 2>&1; then
     shellcheck -S error "$f" || fail "shellcheck: $f"
   done < <(for f in install.sh bin/*; do
              [ -f "$f" ] || continue
-             # Shell files only, chosen by shebang. bin/ is mixed: domainjson is
-             # Node, and shellcheck reads perfectly good JS as a screenful of
+             # Shell files only, chosen by shebang. bin/ can be mixed: a Node tool
+             # would be, and shellcheck reads perfectly good JS as a screenful of
              # SC1127 "was this intended as a comment?".
              case "$(head -1 "$f")" in *bash*|*/sh|*"env sh"*|*dash*) echo "$f" ;; esac
            done)
