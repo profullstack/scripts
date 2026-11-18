@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# og-keys-watch: tell Anthony when an OutreachGraph workspace's keys are locked.
+#
+# OutreachGraph seals each workspace's mailbox passwords to a key only the
+# owner's passphrase opens (seal v2). The opened key lives in the app's memory
+# with a TTL (max 7 days), and every deploy or restart drops it. While locked,
+# autopilot sends nothing and says so only in the container log, so a campaign
+# can sit at "0 sent" for weeks: it did from 2026-11-02 to 2026-11-18.
+#
+# This asks GET /api/v1/keys (service token + workspace headers) and:
+#   locked             -> one alert a day: unlock at <app>/keys (pick 7 days)
+#   unlocked, < 24 h   -> one reminder per unlock before it expires
+#   unlocked, more     -> nothing
+#
+#   og-keys-watch --check          print the state, alert nobody
+#
+# Env (or ~/.config/og-keys-watch/env):
+#   OG_WATCH_WORKSPACE   workspace id (wsp_...), required
+#   OG_WATCH_ORG         organization id (org_...), required
+#   OG_APP_ENV           app.env holding API_TOKEN (default ~/www/outreachgraph.com/app.env)
+#   OG_CONTAINER         container to read the port from (default outreachgraphcom-app-1)
+#   OG_PUBLIC_URL        where Anthony unlocks (default https://outreachgraph.com)
+# Cron: 7 * * * *  og-keys-watch
+set -uo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+
+CONF="$HOME/.config/og-keys-watch/env"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+WS="${OG_WATCH_WORKSPACE:-}"
+ORG="${OG_WATCH_ORG:-}"
+APP_ENV="${OG_APP_ENV:-$HOME/www/outreachgraph.com/app.env}"
+CONTAINER="${OG_CONTAINER:-outreachgraphcom-app-1}"
+PUBLIC="${OG_PUBLIC_URL:-https://outreachgraph.com}"
+ALERT="${OG_ALERT:-$HOME/.local/bin/alert}"
+
+check_only=0
+[ "${1:-}" = --check ] && check_only=1
+
+if [ -z "$WS" ] || [ -z "$ORG" ]; then
+  echo "og-keys-watch: set OG_WATCH_WORKSPACE and OG_WATCH_ORG" >&2
+  exit 2
+fi
+
+token=$(grep -E '^API_TOKEN=' "$APP_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
+port=$(docker port "$CONTAINER" 2>/dev/null | grep -oE '[0-9]+$' | head -1)
+if [ -z "$token" ] || [ -z "$port" ]; then
+  msg="OutreachGraph key watch cannot run: no API_TOKEN in $APP_ENV or no port for $CONTAINER."
+  if (( check_only )); then echo "$msg"; exit 1; fi
+  "$ALERT" --key og-keys-watch-broken --every 24h "$msg" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+body=$(curl -sS --max-time 30 "http://127.0.0.1:$port/api/v1/keys" \
+  -H "authorization: Bearer $token" -H "x-workspace-id: $WS" -H "x-organization-id: $ORG") || body=''
+state=$(printf '%s' "$body" | jq -r '.state // "unknown"' 2>/dev/null || echo unknown)
+paused=$(printf '%s' "$body" | jq -r '.autopilot_paused // false' 2>/dev/null || echo false)
+expires=$(printf '%s' "$body" | jq -r '.expires_at // empty' 2>/dev/null || true)
+
+case "$state" in
+  locked)
+    msg="OutreachGraph keys are LOCKED (autopilot paused: $paused). No campaign email goes out until you unlock at $PUBLIC/keys, 7 days."
+    if (( check_only )); then echo "$msg"; exit 1; fi
+    if [ "$paused" = true ]; then
+      "$ALERT" --key og-keys-locked --every 24h "$msg" >/dev/null 2>&1 || true
+    fi
+    exit 0 ;;
+  unlocked) ;;
+  setup_required)
+    echo "OutreachGraph workspace has no key passphrase; nothing is sealed, nothing to watch."
+    exit 0 ;;
+  *)
+    msg="OutreachGraph key state unknown (got '$state'). Check $PUBLIC/keys."
+    if (( check_only )); then echo "$msg"; exit 1; fi
+    "$ALERT" --key og-keys-unknown --every 24h "$msg" >/dev/null 2>&1 || true
+    exit 1 ;;
+esac
+
+"$ALERT" --clear og-keys-locked >/dev/null 2>&1 || true
+until=$(date -u -d "$expires" +%s 2>/dev/null || echo 0)
+left=$(( until - $(date -u +%s) ))
+echo "OutreachGraph keys unlocked until $expires ($(( left / 3600 ))h left)"
+(( check_only )) && exit 0
+if (( until > 0 && left <= 86400 )); then
+  "$ALERT" --key "og-keys-expiry-$until" --every 7d \
+    "OutreachGraph keys lock in $(( left / 3600 ))h (at $expires). Unlock again at $PUBLIC/keys, 7 days, or campaign email stops." >/dev/null 2>&1 || true
+fi
+exit 0
