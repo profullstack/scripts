@@ -39,9 +39,9 @@ const val = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] 
 
 const DEFAULT_TO = process.env.NICHEDB_REPORT_TO || 'anthony@profullstack.com,preshy@profullstack.com';
 const TO = val('--to', DEFAULT_TO);
-const APP_HOST = process.env.NICHEDB_APP_HOST || 'root@dev2.profullstack.com';
+const APP_HOST = process.env.NICHEDB_APP_HOST || 'anthony@dev2.profullstack.com';
 const APP_CONTAINER = process.env.NICHEDB_APP_CONTAINER || 'nichedbdev-app-1';
-const SSH_KEY = process.env.NICHEDB_SSH_KEY || join(homedir(), '.ssh/id_rsa');
+const SSH_KEY = process.env.NICHEDB_SSH_KEY || join(homedir(), '.ssh/id_ed25519');
 const DATA = join(homedir(), '.local/share/nichedb-nightly');
 const SNAPSHOTS = join(DATA, 'snapshots.jsonl');
 const SITE = 'https://nichedb.dev';
